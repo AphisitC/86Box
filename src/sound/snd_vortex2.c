@@ -1,0 +1,914 @@
+/*
+ * 86Box    A hypervisor and IBM PC system emulator that specializes in
+ *          running old operating systems and software designed for IBM
+ *          PC systems and compatibles from 1981 through fairly recent
+ *          system designs based on the PCI bus.
+ *
+ *          This file is part of the 86Box distribution.
+ *
+ *          Aureal Vortex 2 (AU8830) PCI sound card, as on the Aureal
+ *          SQ2500. Runs Aureal's own Windows drivers and A3D library:
+ *          the driver computes the HRTF filters on the host and the
+ *          chip model (snd_vortex2_core.c) plays them.
+ *
+ *          This file connects the chip model to 86Box: PCI identity and
+ *          BARs, bus-master DMA, the interrupt line, the sample timer,
+ *          the STAC9708 AC'97 codec and the sound output.
+ *
+ *          PCI configuration values were read from an SQ2500 (AU8830,
+ *          revision 0xfa).
+ *
+ * Authors: Z2k Retro and contributors.
+ *
+ *          Copyright 2026 Z2k Retro.
+ */
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
+#include <math.h>
+#define HAVE_STDARG_H
+#include <86box/86box.h>
+#include <86box/device.h>
+#include <86box/dma.h>
+#include <86box/io.h>
+#include <86box/mem.h>
+#include <86box/pci.h>
+#include <86box/timer.h>
+#include <86box/sound.h>
+#include <86box/snd_ac97.h>
+#include <86box/plat_unused.h>
+#include <86box/plat.h>
+#include <86box/path.h>
+
+#include "snd_vortex2_core.h"
+
+#define V2_VENDOR    0x12eb
+#define V2_DEVICE    0x0002
+#define V2_REVISION  0xfa
+#define V2_IO_SIZE   8
+
+typedef struct vortex2_t {
+    v2_chip_t    *chip;
+    ac97_codec_t *codec;
+
+    uint8_t  pci_regs[256];
+    uint8_t  pci_slot;
+    uint8_t  irq_state;
+    uint32_t bar0;
+    uint16_t bar1, bar2;
+    uint16_t io1_mapped, io2_mapped;
+    uint32_t index;
+
+    mem_mapping_t mmio;
+
+    pc_timer_t block_timer;
+    pc_timer_t irq_timer;
+    uint64_t   irq_period;
+    uint64_t   block_latch;
+    uint64_t   block_tsc;
+    uint32_t   frames;
+
+    int   rear_mix;
+    int   log_routes;
+    int   cd_filter;
+    /* CD audio on its way into the codec's ADC: 44.1 kHz frames written by
+       86Box's CD-audio thread, read by the emulation thread. */
+#define CD_RING 16384
+    int16_t           cd_ring[CD_RING][2];
+    volatile uint32_t cd_wr, cd_rd;
+    int16_t           cd_pend;
+    double            cd_phase;
+    float             cd_prev[2], cd_cur[2];
+    int               cd_primed; /* enough buffered to play without gaps */
+    uint32_t          cd_log_n, cd_log_wr; /* diagnostic log: samples since the last line, cd_wr then */
+    float             cd_log_peak;
+    float             cd_level;  /* drive's analog output against codec full scale */
+    FILE *logf;
+    FILE *tracef; /* register trace, same format as the real-card sessions */
+    FILE *dmaf;   /* sample data the chip fetched: u32 addr, u32 len, bytes */
+    float out[V2_BLOCK * 4];
+
+    int16_t ring[V2_BLOCK * 8 * 2];
+    int     ring_rd, ring_n;
+    int16_t last[2];
+
+    int32_t buffer[SOUNDBUFLEN * 2];
+    int     pos;
+} vortex2_t;
+
+#ifdef ENABLE_VORTEX2_LOG
+int vortex2_do_log = ENABLE_VORTEX2_LOG;
+
+static void
+vortex2_log(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (vortex2_do_log) {
+        va_start(ap, fmt);
+        pclog_ex(fmt, ap);
+        va_end(ap);
+    }
+}
+#else
+#    define vortex2_log(fmt, ...)
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Host callbacks for the chip model                                  */
+/* ------------------------------------------------------------------ */
+
+static void
+host_mem_read(void *priv, uint32_t addr, uint8_t *buf, uint32_t len)
+{
+    const vortex2_t *dev = (vortex2_t *) priv;
+
+    if (dev->pci_regs[0x04] & PCI_COMMAND_L_BM)
+        dma_bm_read(addr, buf, len, 4);
+    else
+        memset(buf, 0, len);
+    if (dev->dmaf) {
+        fwrite(&addr, 4, 1, dev->dmaf);
+        fwrite(&len, 4, 1, dev->dmaf);
+        fwrite(buf, 1, len, dev->dmaf);
+    }
+}
+
+static void
+host_mem_write(void *priv, uint32_t addr, const uint8_t *buf, uint32_t len)
+{
+    const vortex2_t *dev = (vortex2_t *) priv;
+
+    if (dev->pci_regs[0x04] & PCI_COMMAND_L_BM)
+        dma_bm_write(addr, buf, len, 4);
+}
+
+static void
+host_set_irq(void *priv, int level)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    if (level)
+        pci_set_irq(dev->pci_slot, PCI_INTA, &dev->irq_state);
+    else
+        pci_clear_irq(dev->pci_slot, PCI_INTA, &dev->irq_state);
+}
+
+static void
+host_timer_arm(void *priv, uint32_t samples)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    timer_disable(&dev->irq_timer);
+    dev->irq_period = samples ? (uint64_t) ((double) TIMER_USEC * (double) samples * 1000000.0 / (double) V2_RATE) : 0;
+    if (dev->irq_period)
+        timer_set_delay_u64(&dev->irq_timer, dev->irq_period);
+}
+
+static uint32_t
+host_clock(void *priv)
+{
+    const vortex2_t *dev = (vortex2_t *) priv;
+    uint64_t         dt  = tsc - dev->block_tsc;
+    uint64_t         sub = (dt * 12288ull) / (TIMER_USEC * 1000ull); /* 12.288 MHz */
+
+    if (sub > V2_BLOCK * 256 - 1)
+        sub = V2_BLOCK * 256 - 1;
+    return dev->frames * 256u + (uint32_t) sub;
+}
+
+/* Register trace in the format of the real-card sessions' timeline.txt,
+   so the same tools replay either. */
+static double
+trace_time(const vortex2_t *dev)
+{
+    return (double) host_clock((void *) dev) / (256.0 * 48000.0);
+}
+
+static uint32_t
+tr_read(vortex2_t *dev, uint32_t a)
+{
+    uint32_t v = v2_read(dev->chip, a);
+    if (dev->tracef)
+        fprintf(dev->tracef, "%11.6f  R 0x%05x mmio 0x%08x\n", trace_time(dev), a, v);
+    return v;
+}
+
+static void
+tr_write(vortex2_t *dev, uint32_t a, uint32_t v)
+{
+    if (dev->tracef)
+        fprintf(dev->tracef, "%11.6f  W 0x%05x mmio 0x%08x\n", trace_time(dev), a, v);
+    v2_write(dev->chip, a, v);
+}
+
+static uint16_t
+host_codec_read(void *priv, uint8_t reg)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    return dev->codec ? ac97_codec_readw(dev->codec, reg) : 0xffff;
+}
+
+/* CD audio reaches the SQ2500 as analog into the codec's CD input, which
+   the codec mixes straight into its output: so the codec's CD volume
+   (0x12) and master volume (0x02) apply to it, and nothing on the
+   Vortex itself does. */
+static void
+vortex2_filter_cd_audio(int channel, double *buffer, void *priv)
+{
+    const vortex2_t *dev = (const vortex2_t *) priv;
+    int              cl = 0, cr = 0, ml = 0, mr = 0;
+
+    if (!dev->codec) {
+        *buffer = 0.0;
+        return;
+    }
+    /* The codec also digitises the CD input when its record select picks
+       CD; the Aureal driver plays CD audio that way (it mutes the analog CD
+       path, register 0x12, and routes the ADC through the Vortex mixer). */
+    {
+        vortex2_t *d = (vortex2_t *) priv;
+        double     v = *buffer;
+        int16_t    sv = (int16_t) (v > 32767.0 ? 32767 : v < -32768.0 ? -32768 : v);
+        if (channel == 0)
+            d->cd_pend = sv;
+        else if (d->cd_wr - d->cd_rd < CD_RING) {
+            d->cd_ring[d->cd_wr % CD_RING][0] = d->cd_pend;
+            d->cd_ring[d->cd_wr % CD_RING][1] = sv;
+            d->cd_wr++;
+        }
+    }
+    ac97_codec_getattn(dev->codec, 0x12, &cl, &cr);
+    ac97_codec_getattn(dev->codec, 0x02, &ml, &mr);
+    *buffer *= channel ? ((double) cr * mr / (32768.0 * 32768.0)) : ((double) cl * ml / (32768.0 * 32768.0));
+}
+
+static void
+host_codec_write(void *priv, uint8_t reg, uint16_t val)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    if (dev->codec) {
+        if (dev->log_routes && dev->logf && reg != 0x26 && reg != 0x2c && reg != 0x32) {
+            fprintf(dev->logf, "Vortex2: [%9.3f] codec %02x <- %04x\n", (double) dev->frames / 48000.0, reg, val);
+            fflush(dev->logf);
+        }
+        ac97_codec_writew(dev->codec, reg, val);
+        /* Install the CD filter once the driver sets up the CD input, as the
+           VIA AC'97 device does; the codec mutes CD at reset, so installing
+           it earlier would silence CD audio for software that never sets it. */
+        if (reg == 0x12 && !dev->cd_filter) {
+            sound_set_cd_audio_filter(vortex2_filter_cd_audio, dev);
+            dev->cd_filter = 1;
+        }
+    }
+}
+
+/* The codec's ADC input for one block: CD audio, resampled from 44.1 to
+   48 kHz, when the record select (0x1a) picks CD (source 1), after the
+   record gain (0x1c: 1.5 dB steps from 0 dB, bit 15 mutes). Other record
+   sources are not emulated.
+
+   The CD reaches the card as an analog signal, and the driver sets the
+   record gain to +12 dB on the real card too, so the level depends on the
+   drive's line output and the card's input stage, which have not been
+   measured. Taking the drive's digital full scale as the codec's full
+   scale left the music about 14 dB above the game sound in the Half-Life
+   tram ride and clipping, where real-card recordings have it beneath the
+   game sound; the "cd_level" option sets the drive's output against codec
+   full scale. The default, -12 dB, matches the balance of the current
+   Steam release: with the track located in recordings, the music sits
+   about 7 dB below the game sound there, against about 6 dB above in
+   86Box at 0 dB with the CD mixer inputs at 0x00. A YouTube recording of
+   the CD release gave 18 dB and a rough listening test 8 dB. */
+static void
+host_codec_adc(void *priv, float *l, float *r, int n)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+    uint16_t   sel = dev->codec ? ac97_codec_readw(dev->codec, 0x1a) : 0;
+    uint16_t   rg  = dev->codec ? ac97_codec_readw(dev->codec, 0x1c) : 0x8000;
+    float      k   = dev->cd_level / 32768.0f;
+    float      gl  = (rg & 0x8000) || ((sel >> 8) & 7) != 1 ? 0.0f : powf(10.0f, ((rg >> 8) & 15) * 1.5f / 20.0f) * k;
+    float      gr  = (rg & 0x8000) || (sel & 7) != 1 ? 0.0f : powf(10.0f, (rg & 15) * 1.5f / 20.0f) * k;
+    uint32_t   avail = dev->cd_wr - dev->cd_rd;
+
+    /* CD audio arrives from 86Box's CD thread in chunks of 100 ms
+       (CD_BUFLEN), at times late. Hold about 136 ms in reserve before
+       playing, and start
+       over if it runs dry, so a late chunk does not leave gaps; drop only
+       a large backlog, so the delay stays short. */
+    if (avail > 13000) {
+        dev->cd_rd = dev->cd_wr - 6000;
+        avail      = 6000;
+    }
+    if (!dev->cd_primed && avail >= 6000)
+        dev->cd_primed = 1;
+    for (int i = 0; i < n; i++) {
+        dev->cd_phase += 44100.0 / 48000.0;
+        while (dev->cd_phase >= 1.0) {
+            dev->cd_phase -= 1.0;
+            dev->cd_prev[0] = dev->cd_cur[0];
+            dev->cd_prev[1] = dev->cd_cur[1];
+            if (dev->cd_primed && dev->cd_wr != dev->cd_rd) {
+                dev->cd_cur[0] = dev->cd_ring[dev->cd_rd % CD_RING][0];
+                dev->cd_cur[1] = dev->cd_ring[dev->cd_rd % CD_RING][1];
+                dev->cd_rd++;
+            } else {
+                dev->cd_primed = 0; /* ran dry (or nothing playing): refill first */
+                dev->cd_cur[0] = dev->cd_cur[1] = 0.0f;
+            }
+        }
+        float f = (float) dev->cd_phase;
+        l[i] = (dev->cd_prev[0] + (dev->cd_cur[0] - dev->cd_prev[0]) * f) * gl;
+        r[i] = (dev->cd_prev[1] + (dev->cd_cur[1] - dev->cd_prev[1]) * f) * gr;
+    }
+    if (dev->log_routes && dev->logf) {
+        /* Every 10 s: whether CD audio is arriving from the drive and how loud it is at the ADC. */
+        for (int i = 0; i < n; i++)
+            if (fabsf(l[i]) > dev->cd_log_peak)
+                dev->cd_log_peak = fabsf(l[i]);
+        dev->cd_log_n += n;
+        if (dev->cd_log_n >= 480000) {
+            fprintf(dev->logf, "Vortex2: [%9.3f] cd: %u frames from the drive in 10 s, ADC peak %.1f dBFS (select %04x, gain %04x, level option %.1f dB)\n",
+                    (double) dev->frames / 48000.0, (unsigned) (dev->cd_wr - dev->cd_log_wr),
+                    dev->cd_log_peak > 0.0f ? 20.0 * log10(dev->cd_log_peak) : -200.0, sel, rg, 20.0 * log10(dev->cd_level));
+            fflush(dev->logf);
+            dev->cd_log_n    = 0;
+            dev->cd_log_wr   = dev->cd_wr;
+            dev->cd_log_peak = 0.0f;
+        }
+    }
+}
+
+static void
+host_log(void *priv, const char *msg)
+{
+    const vortex2_t *dev = (vortex2_t *) priv;
+
+    if (dev->log_routes && dev->logf) {
+        fputs(msg, dev->logf);
+        fflush(dev->logf);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Sound output                                                        */
+/* ------------------------------------------------------------------ */
+
+static inline int16_t
+to_s16(float v)
+{
+    int s = (int) lrintf(v * 32768.0f);
+    return (s > 32767) ? 32767 : ((s < -32768) ? -32768 : s);
+}
+
+static void
+vortex2_update(vortex2_t *dev)
+{
+    for (; dev->pos < sound_pos_global; dev->pos++) {
+        if (dev->ring_n > 0) {
+            dev->last[0] = dev->ring[dev->ring_rd * 2];
+            dev->last[1] = dev->ring[dev->ring_rd * 2 + 1];
+            dev->ring_rd = (dev->ring_rd + 1) % (V2_BLOCK * 8);
+            dev->ring_n--;
+        }
+        dev->buffer[dev->pos * 2]     = dev->last[0];
+        dev->buffer[dev->pos * 2 + 1] = dev->last[1];
+    }
+}
+
+static void
+vortex2_block(void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+    int        ml = 32767, mr = 32767, pl = 32767, pr = 32767, sl = 32767, sr = 32767;
+
+    timer_advance_u64(&dev->block_timer, dev->block_latch);
+
+    vortex2_update(dev);
+    dev->block_tsc = tsc;
+    v2_run_block(dev->chip, dev->out);
+    dev->frames += V2_BLOCK;
+
+    if (dev->codec) {
+        ac97_codec_getattn(dev->codec, 0x02, &ml, &mr);
+        ac97_codec_getattn(dev->codec, 0x18, &pl, &pr);
+        ac97_codec_getattn(dev->codec, 0x38, &sl, &sr);
+    }
+    float gl = (float) ml * (float) pl / (32768.0f * 32768.0f);
+    float gr = (float) mr * (float) pr / (32768.0f * 32768.0f);
+    float rl = dev->rear_mix ? (float) sl / 32768.0f : 0.0f;
+    float rr = dev->rear_mix ? (float) sr / 32768.0f : 0.0f;
+
+    for (int n = 0; n < V2_BLOCK; n++) {
+        float l = dev->out[n * 4 + 0] + dev->out[n * 4 + 2] * rl;
+        float r = dev->out[n * 4 + 1] + dev->out[n * 4 + 3] * rr;
+        /* The chip's output saturates at digital full scale before the
+           codec's volume (run 12: summed tones clip at full scale). */
+        l = (l > 1.0f) ? 1.0f : ((l < -1.0f) ? -1.0f : l);
+        r = (r > 1.0f) ? 1.0f : ((r < -1.0f) ? -1.0f : r);
+        int   w = (dev->ring_rd + dev->ring_n) % (V2_BLOCK * 8);
+        if (dev->ring_n >= V2_BLOCK * 8) { /* consumer stalled: drop the oldest */
+            dev->ring_rd = (dev->ring_rd + 1) % (V2_BLOCK * 8);
+            dev->ring_n--;
+            w = (dev->ring_rd + dev->ring_n) % (V2_BLOCK * 8);
+        }
+        dev->ring[w * 2]     = to_s16(l * gl);
+        dev->ring[w * 2 + 1] = to_s16(r * gr);
+        dev->ring_n++;
+    }
+}
+
+static void
+vortex2_get_buffer(int32_t *buffer, uint16_t len, void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    vortex2_update(dev);
+    for (uint16_t c = 0; c < len * 2; c++)
+        buffer[c] += dev->buffer[c];
+    dev->pos = 0;
+}
+
+static void
+vortex2_irq_timer(void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    /* The counter reloads and keeps running; the driver normally rewrites
+       the period in every interrupt anyway. */
+    if (dev->irq_period)
+        timer_advance_u64(&dev->irq_timer, dev->irq_period);
+    v2_timer_expired(dev->chip);
+}
+
+/* ------------------------------------------------------------------ */
+/* BAR0: the register file                                            */
+/* ------------------------------------------------------------------ */
+
+static uint32_t
+vortex2_mmio_readl(uint32_t addr, void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    return tr_read(dev, addr - dev->bar0);
+}
+
+static uint16_t
+vortex2_mmio_readw(uint32_t addr, void *priv)
+{
+    return vortex2_mmio_readl(addr & ~3, priv) >> ((addr & 2) * 8);
+}
+
+static uint8_t
+vortex2_mmio_readb(uint32_t addr, void *priv)
+{
+    return vortex2_mmio_readl(addr & ~3, priv) >> ((addr & 3) * 8);
+}
+
+static void
+vortex2_mmio_writel(uint32_t addr, uint32_t val, void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    tr_write(dev, addr - dev->bar0, val);
+}
+
+static void
+vortex2_mmio_writew(uint32_t addr, uint16_t val, void *priv)
+{
+    vortex2_t *dev   = (vortex2_t *) priv;
+    uint32_t   a     = (addr & ~3) - dev->bar0;
+    int        shift = (addr & 2) * 8;
+    uint32_t   old   = v2_read(dev->chip, a);
+
+    tr_write(dev, a, (old & ~(0xffffu << shift)) | ((uint32_t) val << shift));
+}
+
+static void
+vortex2_mmio_writeb(uint32_t addr, uint8_t val, void *priv)
+{
+    vortex2_t *dev   = (vortex2_t *) priv;
+    uint32_t   a     = (addr & ~3) - dev->bar0;
+    int        shift = (addr & 3) * 8;
+    uint32_t   old   = v2_read(dev->chip, a);
+
+    tr_write(dev, a, (old & ~(0xffu << shift)) | ((uint32_t) val << shift));
+}
+
+/* ------------------------------------------------------------------ */
+/* BAR1: address (+0) / data (+4) window onto the same registers. The */
+/* Windows driver uses it only during early initialisation. With the  */
+/* chip control register's auto-increment bit (0x2a00c bit 19) set,   */
+/* address bits 9-2 step by one register after each data access (for  */
+/* the Sound Blaster TSR's reads of the FM register image).           */
+/* BAR2: the modem side of the parallel interface, for the SQ3500's   */
+/* daughterboard: eight byte registers laid out like a 16550 UART's.  */
+/* The driver sets loopback (0x10 to +4, the modem control register)  */
+/* and reads the modem status at +6; with nothing fitted it reads     */
+/* 0xff, as on the SQ2500.                                            */
+/* ------------------------------------------------------------------ */
+
+static void
+io1_step(vortex2_t *dev)
+{
+    if (v2_read(dev->chip, 0x2a00c) & (1u << 19))
+        dev->index = (dev->index & ~0x3fcu) | ((dev->index + 4) & 0x3fcu);
+}
+
+static uint32_t
+io1_get(vortex2_t *dev, uint16_t port)
+{
+    if (!(port & 4))
+        return dev->index;
+    uint32_t v = tr_read(dev, dev->index & 0x3fffc);
+    io1_step(dev);
+    return v;
+}
+
+static void
+io1_put(vortex2_t *dev, uint16_t port, uint32_t val, uint32_t mask)
+{
+    if (port & 4) {
+        uint32_t a   = dev->index & 0x3fffc;
+        uint32_t old = (mask == 0xffffffff) ? 0 : v2_read(dev->chip, a);
+        tr_write(dev, a, (old & ~mask) | (val & mask));
+        io1_step(dev);
+    } else
+        dev->index = (dev->index & ~mask) | (val & mask);
+}
+
+static uint8_t
+vortex2_io1_inb(uint16_t port, void *priv)
+{
+    return io1_get((vortex2_t *) priv, port) >> ((port & 3) * 8);
+}
+
+static uint16_t
+vortex2_io1_inw(uint16_t port, void *priv)
+{
+    return io1_get((vortex2_t *) priv, port) >> ((port & 2) * 8);
+}
+
+static uint32_t
+vortex2_io1_inl(uint16_t port, void *priv)
+{
+    return io1_get((vortex2_t *) priv, port);
+}
+
+static void
+vortex2_io1_outb(uint16_t port, uint8_t val, void *priv)
+{
+    int sh = (port & 3) * 8;
+    io1_put((vortex2_t *) priv, port, (uint32_t) val << sh, 0xffu << sh);
+}
+
+static void
+vortex2_io1_outw(uint16_t port, uint16_t val, void *priv)
+{
+    int sh = (port & 2) * 8;
+    io1_put((vortex2_t *) priv, port, (uint32_t) val << sh, 0xffffu << sh);
+}
+
+static void
+vortex2_io1_outl(uint16_t port, uint32_t val, void *priv)
+{
+    io1_put((vortex2_t *) priv, port, val, 0xffffffff);
+}
+
+static uint8_t
+vortex2_io2_inb(UNUSED(uint16_t port), UNUSED(void *priv))
+{
+    return 0xff;
+}
+
+static void
+vortex2_io2_outb(UNUSED(uint16_t port), UNUSED(uint8_t val), UNUSED(void *priv))
+{
+    /* not modelled */
+}
+
+/* ------------------------------------------------------------------ */
+/* PCI configuration space                                            */
+/* ------------------------------------------------------------------ */
+
+static void
+vortex2_remap(vortex2_t *dev)
+{
+    int mem_on = dev->pci_regs[0x04] & PCI_COMMAND_MEM;
+    int io_on  = dev->pci_regs[0x04] & PCI_COMMAND_IO;
+
+    mem_mapping_disable(&dev->mmio);
+    if (mem_on && dev->bar0)
+        mem_mapping_set_addr(&dev->mmio, dev->bar0, V2_REG_SIZE);
+
+    if (dev->io1_mapped) {
+        io_removehandler(dev->io1_mapped, V2_IO_SIZE,
+                         vortex2_io1_inb, vortex2_io1_inw, vortex2_io1_inl,
+                         vortex2_io1_outb, vortex2_io1_outw, vortex2_io1_outl, dev);
+        dev->io1_mapped = 0;
+    }
+    if (dev->io2_mapped) {
+        io_removehandler(dev->io2_mapped, V2_IO_SIZE,
+                         vortex2_io2_inb, NULL, NULL, vortex2_io2_outb, NULL, NULL, dev);
+        dev->io2_mapped = 0;
+    }
+    if (io_on && dev->bar1) {
+        io_sethandler(dev->bar1, V2_IO_SIZE,
+                      vortex2_io1_inb, vortex2_io1_inw, vortex2_io1_inl,
+                      vortex2_io1_outb, vortex2_io1_outw, vortex2_io1_outl, dev);
+        dev->io1_mapped = dev->bar1;
+    }
+    if (io_on && dev->bar2) {
+        io_sethandler(dev->bar2, V2_IO_SIZE,
+                      vortex2_io2_inb, NULL, NULL, vortex2_io2_outb, NULL, NULL, dev);
+        dev->io2_mapped = dev->bar2;
+    }
+    vortex2_log("Vortex2: BAR0 %08x BAR1 %04x BAR2 %04x mem %d io %d\n",
+                dev->bar0, dev->bar1, dev->bar2, !!mem_on, !!io_on);
+}
+
+static uint8_t
+vortex2_pci_read(int func, int addr, UNUSED(int len), void *priv)
+{
+    const vortex2_t *dev = (vortex2_t *) priv;
+
+    if (func)
+        return 0xff;
+
+    switch (addr) {
+        case 0x10 ... 0x13:
+            return dev->bar0 >> ((addr & 3) * 8);
+        case 0x14 ... 0x17:
+            return (dev->bar1 | 1) >> ((addr & 3) * 8);
+        case 0x18 ... 0x1b:
+            return (dev->bar2 | 1) >> ((addr & 3) * 8);
+        default:
+            return dev->pci_regs[addr & 0xff];
+    }
+}
+
+static void
+vortex2_pci_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+    uint32_t   sh  = (addr & 3) * 8;
+
+    if (func)
+        return;
+
+    switch (addr) {
+        case 0x04:
+            dev->pci_regs[0x04] = val & (PCI_COMMAND_IO | PCI_COMMAND_MEM | PCI_COMMAND_L_BM | 0x40);
+            vortex2_remap(dev);
+            break;
+        case 0x05:
+            dev->pci_regs[0x05] = val & 0x01;
+            break;
+        case 0x07:
+            dev->pci_regs[0x07] &= ~(val & 0xf9);
+            break;
+        case 0x0c:
+        case 0x0d:
+        case 0x3c:
+        case 0x40: /* vendor register (0x80 at reset) */
+            dev->pci_regs[addr] = val;
+            break;
+        case 0x10 ... 0x13:
+            dev->bar0 = (dev->bar0 & ~(0xffu << sh)) | ((uint32_t) val << sh);
+            dev->bar0 &= ~(V2_REG_SIZE - 1);
+            vortex2_remap(dev);
+            break;
+        case 0x14 ... 0x15:
+            dev->bar1 = (dev->bar1 & ~(0xffu << sh)) | ((uint32_t) val << sh);
+            dev->bar1 &= ~(V2_IO_SIZE - 1);
+            vortex2_remap(dev);
+            break;
+        case 0x18 ... 0x19:
+            dev->bar2 = (dev->bar2 & ~(0xffu << sh)) | ((uint32_t) val << sh);
+            dev->bar2 &= ~(V2_IO_SIZE - 1);
+            vortex2_remap(dev);
+            break;
+        case 0xe0: /* PMCSR power state */
+            if (((dev->pci_regs[0xe0] & 3) == 3) && !(val & 3))
+                v2_reset(dev->chip); /* NoSoftRst-: D3 -> D0 resets the chip */
+            dev->pci_regs[0xe0] = val & 0x03;
+            break;
+        default:
+            break;
+    }
+}
+
+static void
+vortex2_pci_init_regs(vortex2_t *dev)
+{
+    memset(dev->pci_regs, 0, sizeof(dev->pci_regs));
+    dev->pci_regs[0x00] = V2_VENDOR & 0xff;
+    dev->pci_regs[0x01] = V2_VENDOR >> 8;
+    dev->pci_regs[0x02] = V2_DEVICE & 0xff;
+    dev->pci_regs[0x03] = V2_DEVICE >> 8;
+    dev->pci_regs[0x06] = 0x90; /* capability list, fast back-to-back */
+    dev->pci_regs[0x07] = 0x02; /* DEVSEL medium */
+    dev->pci_regs[0x08] = V2_REVISION;
+    dev->pci_regs[0x09] = 0x00;
+    dev->pci_regs[0x0a] = 0x01; /* multimedia audio */
+    dev->pci_regs[0x0b] = 0x04;
+    dev->pci_regs[0x2c] = V2_VENDOR & 0xff;
+    dev->pci_regs[0x2d] = V2_VENDOR >> 8;
+    dev->pci_regs[0x2e] = V2_DEVICE & 0xff;
+    dev->pci_regs[0x2f] = V2_DEVICE >> 8;
+    dev->pci_regs[0x34] = 0xdc;
+    dev->pci_regs[0x3d] = PCI_INTA;
+    dev->pci_regs[0x3e] = 0x04; /* MIN_GNT */
+    dev->pci_regs[0x3f] = 0x0c; /* MAX_LAT */
+    dev->pci_regs[0x40] = 0x80;
+    dev->pci_regs[0xdc] = 0x01; /* power management, version 1.0 */
+    dev->pci_regs[0xdd] = 0x00;
+    dev->pci_regs[0xde] = 0x21; /* DSI, D2 supported */
+    dev->pci_regs[0xdf] = 0x04;
+    dev->bar0           = 0;
+    dev->bar1           = 0;
+    dev->bar2           = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Device                                                              */
+/* ------------------------------------------------------------------ */
+
+static void
+vortex2_speed_changed(void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    dev->block_latch = (uint64_t) ((double) TIMER_USEC * (1000000.0 * V2_BLOCK / (double) V2_RATE));
+}
+
+static void
+vortex2_reset(void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    v2_reset(dev->chip);
+    if (dev->codec)
+        ac97_codec_reset(dev->codec);
+}
+
+static void *
+vortex2_init(UNUSED(const device_t *info))
+{
+    vortex2_t *dev = calloc(1, sizeof(vortex2_t));
+    v2_host_t  host;
+
+    dev->rear_mix   = device_get_config_int("rear_mix");
+    dev->log_routes = device_get_config_int("log");
+    dev->cd_level   = powf(10.0f, device_get_config_int("cd_level") / 20.0f);
+    if (dev->log_routes) {
+        /* Its own file in the machine's folder, so it works in release
+           builds and without command-line options. */
+        char fn[1024];
+        path_append_filename(fn, usr_path, "vortex2.log");
+        dev->logf = plat_fopen(fn, "w");
+        if (dev->logf) {
+            fprintf(dev->logf, "Vortex2: card added, diagnostic log on\n");
+            fflush(dev->logf);
+        }
+    }
+
+    if (device_get_config_int("trace")) {
+        char fn[1024];
+        path_append_filename(fn, usr_path, "vortex2-trace.txt");
+        dev->tracef = plat_fopen(fn, "w");
+        path_append_filename(fn, usr_path, "vortex2-dma.bin");
+        dev->dmaf = plat_fopen(fn, "wb");
+    }
+
+    memset(&host, 0, sizeof(host));
+    host.priv        = dev;
+    host.mem_read    = host_mem_read;
+    host.mem_write   = host_mem_write;
+    host.set_irq     = host_set_irq;
+    host.timer_arm   = host_timer_arm;
+    host.clock       = host_clock;
+    host.codec_read  = host_codec_read;
+    host.codec_write = host_codec_write;
+    host.log         = host_log;
+    host.codec_adc   = host_codec_adc;
+
+    timer_add(&dev->irq_timer, vortex2_irq_timer, dev, 0);
+
+    dev->chip = v2_create(&host);
+
+    vortex2_pci_init_regs(dev);
+    pci_add_card(PCI_ADD_NORMAL, vortex2_pci_read, vortex2_pci_write, dev, &dev->pci_slot);
+
+    mem_mapping_add(&dev->mmio, 0, 0,
+                    vortex2_mmio_readb, vortex2_mmio_readw, vortex2_mmio_readl,
+                    vortex2_mmio_writeb, vortex2_mmio_writew, vortex2_mmio_writel,
+                    NULL, MEM_MAPPING_EXTERNAL, dev);
+    mem_mapping_disable(&dev->mmio);
+
+    /* SigmaTel STAC9708, as on the SQ2500. */
+    ac97_codec       = &dev->codec;
+    ac97_codec_count = 1;
+    ac97_codec_id    = 0;
+    device_add(&stac9708_device);
+
+    sound_add_handler(vortex2_get_buffer, dev);
+
+    vortex2_speed_changed(dev);
+    timer_add(&dev->block_timer, vortex2_block, dev, 1);
+    timer_set_delay_u64(&dev->block_timer, dev->block_latch);
+
+    return dev;
+}
+
+static void
+vortex2_close(void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    v2_destroy(dev->chip);
+    if (dev->logf)
+        fclose(dev->logf);
+    if (dev->tracef)
+        fclose(dev->tracef);
+    if (dev->dmaf)
+        fclose(dev->dmaf);
+    free(dev);
+}
+
+static const device_config_t vortex2_config[] = {
+    // clang-format off
+    {
+        .name           = "rear_mix",
+        .description    = "Mix rear channels into the stereo output",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "cd_level",
+        .description    = "CD audio input level",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = -12,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "0 dB (drive at codec full scale)", .value =   0 },
+            { .description = "-4 dB",                            .value =  -4 },
+            { .description = "-8 dB",                            .value =  -8 },
+            { .description = "-12 dB (default)",                 .value = -12 },
+            { .description = "-18 dB",                           .value = -18 },
+            { .description = "-24 dB",                           .value = -24 },
+            { .description = ""                                               }
+        },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "log",
+        .description    = "Write diagnostic log (vortex2.log in the machine folder)",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "trace",
+        .description    = "Write register trace (vortex2-trace.txt and vortex2-dma.bin; large)",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    { .name = "", .description = "", .type = CONFIG_END }
+    // clang-format on
+};
+
+const device_t vortex2_device = {
+    .name          = "Aureal Vortex 2 (SQ2500)",
+    .internal_name = "vortex2",
+    .flags         = DEVICE_PCI,
+    .local         = 0,
+    .init          = vortex2_init,
+    .close         = vortex2_close,
+    .reset         = vortex2_reset,
+    .available     = NULL,
+    .speed_changed = vortex2_speed_changed,
+    .force_redraw  = NULL,
+    .config        = vortex2_config
+};
