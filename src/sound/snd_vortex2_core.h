@@ -12,7 +12,7 @@
  *          The core has no 86Box dependencies; snd_vortex2.c wires it
  *          to PCI, memory, timers, the AC'97 codec and the sound output.
  *
- * Authors: Z2k Retro and contributors.
+ * Authors: Z2k Retro, Aphisit Chanmana (อภิสิทธิ์ จันทร์มานะ) and contributors.
  *
  *          Copyright 2026 Z2k Retro.
  */
