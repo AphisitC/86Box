@@ -13,7 +13,7 @@
  *          (driver 4.06.2048), used because the canceller's register-level
  *          arithmetic is not yet decoded.
  *
- * Authors: Z2k Retro and contributors.
+ * Authors: Z2k Retro, Aphisit Chanmana (อภิสิทธิ์ จันทร์มานะ) and contributors.
  *
  *          Copyright 2026 Z2k Retro.
  */
