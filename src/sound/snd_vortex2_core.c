@@ -26,7 +26,7 @@
  *          in blocks of V2_BLOCK frames, evaluating each source on demand;
  *          a feedback loop in the graph gets the previous block's values.
  *
- * Authors: Z2k Retro and contributors.
+ * Authors: Z2k Retro, Aphisit Chanmana (อภิสิทธิ์ จันทร์มานะ) and contributors.
  *
  *          Copyright 2026 Z2k Retro.
  */
