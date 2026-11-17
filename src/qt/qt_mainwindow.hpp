@@ -17,12 +17,14 @@
 
 class MediaMenu;
 class RendererStack;
+class QActionGroup;
 
 namespace Ui {
 class MainWindow;
 }
 
 class MachineStatus;
+class MidiLcdWindow;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -116,6 +118,7 @@ private slots:
     void on_actionFullScreen_int43_triggered();
     void on_actionFullScreen_center_triggered();
     void on_actionFullScreen_center43_triggered();
+    void on_actionFullScreen_int43_vert_triggered();
     void on_actionFullScreen_keepRatio_triggered();
     void on_actionFullScreen_43_triggered();
     void on_actionFullScreen_stretch_triggered();
@@ -140,11 +143,13 @@ private slots:
     void on_actionPreferences_triggered();
     void on_actionRenderer_options_triggered();
     void on_actionFast_forward_triggered();
+    void on_actionFast_forward_on_start_triggered();
 
     void refreshMediaMenu();
     void showMessage_(int flags, const QString &header, const QString &message, bool richText, std::atomic_bool *done = nullptr);
 
     void on_actionMCA_devices_triggered();
+    void on_actionMemory_viewer_triggered();
 
 protected:
     void keyPressEvent(QKeyEvent *event) override;
@@ -183,12 +188,19 @@ private:
     Ui::MainWindow                *ui;
     std::unique_ptr<MachineStatus> status;
     std::shared_ptr<MediaMenu>     mm;
-    QMenu                         *dynarecMenu = nullptr;
+    QMenu                         *dynarecMenu  = nullptr;
+    QActionGroup                  *midiOutGroup = nullptr;
+    MidiLcdWindow                 *midiLcd      = nullptr;
 
     bool hasKanaLock();
+    void refreshMidiOutMenu();
+    void switchMidiOut(int device, int port = -1);
+    void showMidiLcd(bool show);
     void updateShortcuts();
+    void updateMenuKeyboardState();
     void updatePowerOffAction();
     void refreshDisplayRatioActions();
+    bool isMainWindowOrRendererActive() const;
     void processKeyboardInput(bool down, uint32_t keycode);
 #ifdef Q_OS_MACOS
     uint32_t last_modifiers = 0;
@@ -200,6 +212,9 @@ private:
     bool shownonce           = false;
     bool resizableonce       = false;
     bool vnc_enabled         = false;
+
+    /* -1 until the menu keyboard state has been initialized. */
+    int menu_keyboard_state = -1;
 
     /* Full screen ON and OFF signals */
     bool fs_on_signal  = false;
@@ -225,7 +240,6 @@ private:
     QIcon   caps_icon, scroll_icon, num_icon, kana_icon;
     QIcon   caps_icon_off, scroll_icon_off, num_icon_off, kana_icon_off;
 
-    bool isShowMessage  = false;
     bool isNonPause     = false;
     bool window_blocked = false;
 

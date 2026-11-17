@@ -390,9 +390,12 @@ RendererStack::enterEvent(QEvent *event)
 {
     mousedata.mouse_tablet_in_proximity = m_monitor_index + 1;
 
-    if (mouse_input_mode == 1)
-        QApplication::setOverrideCursor((tablet_get_device(tablet_type) && !memcmp(tablet_get_device(tablet_type)->internal_name, "wacom", 5)) ? Qt::BlankCursor : Qt::ArrowCursor);
-    else if (mouse_input_mode == 2)
+    if (mouse_input_mode == 1) {
+        const auto *tablet = tablet_get_device(tablet_type);
+        const bool hide_cursor = tablet_type && tablet && tablet != &mouse_mtouch_device &&
+                                 tablet != &mouse_ibm7690_touch_device && tablet != &mouse_elo_device;
+        QApplication::setOverrideCursor(hide_cursor ? Qt::BlankCursor : Qt::ArrowCursor);
+    } else if (mouse_input_mode == 2)
         QApplication::setOverrideCursor(Qt::CrossCursor);
 }
 
@@ -445,7 +448,8 @@ RendererStack::createRenderer(Renderer renderer)
             {
                 auto sw        = new SoftwareRenderer(this);
                 rendererWindow = sw;
-                connect(this, &RendererStack::blitToRenderer, sw, &SoftwareRenderer::onBlit, Qt::QueuedConnection);
+                /* Delivered on the renderer's worker thread. */
+                connect(this, &RendererStack::blitToRenderer, sw->blitContext(), [sw](int buf_idx, int x, int y, int w, int h) { sw->onBlit(buf_idx, x, y, w, h); }, Qt::QueuedConnection);
                 current.reset(sw);
             }
             break;

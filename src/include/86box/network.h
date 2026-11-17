@@ -42,7 +42,9 @@
  */
 #ifndef EMU_NETWORK_H
 #define EMU_NETWORK_H
+#include <stdbool.h>
 #include <stdint.h>
+#include <86box/thread.h>
 
 /* Network provider types. */
 #define NET_TYPE_NONE     0 /* use the null network driver */
@@ -100,6 +102,7 @@ typedef struct netcard_conf_t {
     char     secret[256];
     uint8_t  promisc_mode;
     char     slirp_net[16];
+    uint8_t  slirp_8023_rx;
     char     nrs_hostname[128];
 } netcard_conf_t;
 
@@ -155,6 +158,12 @@ struct _netcard_t {
     uint32_t        led_timer;
     uint32_t        led_state;
     uint32_t        link_state;
+    /* Effective SLIRP addresses, populated for SLIRP-backed cards. */
+    uint32_t        slirp_host_ip;
+    uint32_t        slirp_dhcp_ip;
+    uint32_t        slirp_dns_ip;
+    bool            internal_modem;
+    bool            slirp_force_auto_range;
 };
 
 typedef struct {
@@ -187,6 +196,7 @@ extern netdev_t         network_devs[NET_HOST_INTF_MAX];
 /* Function prototypes. */
 extern void       network_init(void);
 extern netcard_t *network_attach(void *card_drv, uint8_t *mac, NETRXCB rx, NETSETLINKSTATE set_link_state);
+extern netcard_t *network_attach_modem(void *card_drv, uint8_t *mac, NETRXCB rx);
 extern void       netcard_close(netcard_t *card);
 extern void       network_close(void);
 extern void       network_reset(void);
@@ -242,20 +252,32 @@ extern const device_t rtl8019as_pnp_device;
 extern const device_t de220p_device;
 extern const device_t rtl8029as_device;
 
+/* AMD LANCE */
+extern const device_t ne2100_novell_device;
+extern const device_t lance_vaxmate_device;
+
 /* AMD PCnet */
 extern const device_t pcnet_am79c960_device;
 extern const device_t pcnet_am79c960_eb_device;
 extern const device_t pcnet_am79c960_vlb_device;
 extern const device_t pcnet_am79c961_device;
+extern const device_t pcnet_am79c961a_device;
 extern const device_t pcnet_am79c970a_device;
 extern const device_t pcnet_am79c970a_onboard_device;
 extern const device_t pcnet_am79c973_device;
+extern const device_t pcnet_am79c970_device;
+extern const device_t pcnet_am79c971_device;
+extern const device_t pcnet_am79c972_device;
+extern const device_t pcnet_am79c975_device;
 extern const device_t pcnet_am79c973_onboard_device;
+extern const device_t pcnet_am79c974_device;
 
 /* Modem */
 extern const device_t modem_device;
 
 /* LPT */
+extern const device_t pe1_device;
+extern const device_t pe2_device;
 extern const device_t pe3_device;
 extern const device_t plip_device;
 
@@ -291,6 +313,12 @@ extern const device_t ibm_ethernet_efe5_device;
 /* National Semiconductor */
 extern const device_t dp83815_device;
 extern const device_t dp83815_onboard_device;
+
+/* VIA Rhine */
+extern const device_t via_vt86c100a_device;
+extern const device_t via_vt6102_device;
+extern const device_t via_vt6105_device;
+extern const device_t via_vt6105m_device;
 
 #endif
 

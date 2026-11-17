@@ -24,8 +24,8 @@
 #include <wchar.h>
 #define HAVE_STDARG_H
 #include <86box/86box.h>
-#include <86box/machine.h>
 #include <86box/device.h>
+#include <86box/machine.h>
 #include <86box/keyboard.h>
 #include <86box/plat.h>
 #include <86box/thread.h>
@@ -73,7 +73,7 @@ static keyboard_t keyboard_devices[] = {
 };
 
 #ifdef ENABLE_KBC_AT_LOG
-int kbc_at_do_log = ENABLE_KBC_AT_LOG;
+extern int kbc_at_do_log;
 
 static void
 kbc_at_log(const char* fmt, ...)
@@ -657,6 +657,15 @@ keyboard_get_ndev(void)
 void
 keyboard_add_device(void)
 {
-    if (keyboard_type != KEYBOARD_TYPE_USB)
+    const device_t *kbd = machine_get_kbd_device(machine);
+
+    if (keyboard_type == KEYBOARD_TYPE_USB)
+        return;
+
+    /* A machine that comes with a keyboard of its own always gets that one,
+       even when the configuration selects a different keyboard. */
+    if (kbd != NULL)
+        device_add(kbd);
+    else
         device_add(keyboard_devices[keyboard_type].device);
 }

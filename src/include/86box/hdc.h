@@ -42,9 +42,9 @@ extern const device_t st506_at_wd1003_device;             /* st506_at_wd1003 */
 extern const device_t st506_xt_wd1004a_wx1_device;        /* st506_xt_wd1004a_wx1 */
 extern const device_t st506_xt_wd1004_27x_device;         /* st506_xt_wd1004_27x */
 extern const device_t st506_xt_wd1004a_27x_device;        /* st506_xt_wd1004a_27x */
-extern const device_t st506_tandy2k_wd1010_device;        /* st506_tandy2k_wd1010 */
 extern const device_t st506_xt_victor_v86p_device;        /* st506_xt_victor_v86p */
 extern const device_t st506_xt_toshiba_t1200_device;      /* st506_xt_toshiba_t1200 */
+extern const device_t st506_wd1010_device;                /* st506_wd1010 */
 extern const device_t st506_ps2_device;                   /* st506_mca */
 
 extern const device_t esdi_at_wd1007vse1_device; /* esdi_at */
@@ -92,6 +92,7 @@ extern const device_t ide_pc87410_device;                       /* National Semi
 
 extern const device_t ide_opti611_vlb_device;                   /* OPTi 82c611/611A VLB */
 extern const device_t ide_opti611_vlb_sec_device;               /* OPTi 82c611/611A VLB (Secondary channel) */
+extern const device_t ide_qd6500_vlb_device;                    /* QDI Vision QD6500 VLB */
 
 extern const device_t ide_rz1000_pci_device;                    /* PC Technology RZ-1000 PCI */
 extern const device_t ide_rz1000_pci_single_channel_device;     /* PC Technology RZ-1000 PCI (Only primary channel) */
@@ -136,6 +137,9 @@ extern int             hdc_has_config(int hdc);
 extern const device_t *hdc_get_device(int hdc);
 extern int             hdc_get_flags(int hdc);
 extern int             hdc_available(int hdc);
+#ifdef EMU_DEVICE_H
+extern int             hdc_plan(bus_owner_t *owner, int bus, int mach, const int hdc[]);
+#endif
 
 extern void            ps1_hdc_handler(void *priv, int set);
 

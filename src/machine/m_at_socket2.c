@@ -44,6 +44,7 @@
 #include <86box/port_92.h>
 #include <86box/video.h>
 #include <86box/flash.h>
+#include <86box/scsi.h>
 #include <86box/scsi_ncr53c8xx.h>
 #include <86box/hwm.h>
 #include <86box/machine.h>
@@ -237,7 +238,8 @@ machine_at_pci400ca_init(const machine_t *model)
     device_add(&intel_flash_bxt_ami_device);
 
     device_add(&i420tx_device);
-    device_add(machine_get_scsi_device(machine));
+    if ((scsi_card_current[0] == SCSI_CARD_INTERNAL) && machine_get_scsi_device(machine))
+        device_add(machine_get_scsi_device(machine));
 
     if (fdc_current[0] == FDC_INTERNAL)
         device_add(&fdc_at_device);
@@ -541,7 +543,7 @@ machine_at_sensation2_init(const machine_t *model)
     device_add(&vl82c486_device);
     device_add(&vl82c113_device);
 
-    device_add_params(&fdc37c6xx_device, (void *) (FDC37C651 | FDC37C6XX_IDE_PRI));
+    device_add_params(&fdc37c6xx_device, (void *) (FDC37C651 | FDC37C6XX_IDE_PRI | CT721));
 
     if (gfxcard[0] == VID_INTERNAL)
         device_add(machine_get_vid_device(machine));

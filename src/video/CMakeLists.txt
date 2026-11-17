@@ -76,9 +76,11 @@ add_library(vid OBJECT
 
     # PCjr/PC JX/Tandy
     vid_pcjr.c
+    vid_pcjr_comp.c
     vid_pcjx.c
     vid_tandy1k.c
     vid_tandy2k.c
+    vid_tandy_vis.c
 
     # Hercules
     vid_mda.c
@@ -89,8 +91,8 @@ add_library(vid OBJECT
     # Other early CGA-era cards
     vid_3270pc.c
     vid_genius.c
-    vid_cyrix_gxm.c
     vid_sigma.c
+    vid_vaxmate.c
 
     # PGC / IM1024 / WY700 high-resolution
     vid_pgc.c
@@ -126,6 +128,8 @@ add_library(vid OBJECT
     vid_ati_mach64.c
     vid_ati_mach64_accel.c
     vid_ati_mach64_3d.c
+    vid_ati_mach64_ragepro.c
+    vid_ati_mach64_idct.c
     vid_ati_rage128.c
     vid_ati_rage128_vga.c
     vid_ati_rage128_display.c
@@ -134,6 +138,8 @@ add_library(vid OBJECT
     vid_ati_rage128_pm4.c
     vid_ati_rage128_3d.c
     vid_ati_rage128_mpeg.c
+    vid_ati_rage128_i2c.c
+    vid_ati_rage128_bm.c
     vid_ati_rage128_raster.c
     vid_ati_rage128_mem.c
     vid_ati_rage128_jit.c
@@ -188,8 +194,8 @@ add_library(vid OBJECT
 
     # Generic
     vid_bochs_vbe.c
+    vid_cyrix_gxm.c
     vid_hd44780.c
-    vid_tandy_vis.c
 )
 
 if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
@@ -225,6 +231,8 @@ if(ENABLE_RAGE128_LOG)
         vid_ati_rage128_pm4.c
         vid_ati_rage128_3d.c
         vid_ati_rage128_mpeg.c
+        vid_ati_rage128_i2c.c
+        vid_ati_rage128_bm.c
         vid_ati_rage128_raster.c
         vid_ati_rage128_mem.c
         vid_ati_rage128_jit.c
@@ -250,6 +258,8 @@ if(NOT MSVC)
         vid_ati_rage128_pm4.c
         vid_ati_rage128_3d.c
         vid_ati_rage128_mpeg.c
+        vid_ati_rage128_i2c.c
+        vid_ati_rage128_bm.c
         vid_ati_rage128_raster.c
         vid_ati_rage128_mem.c
         vid_ati_rage128_jit.c

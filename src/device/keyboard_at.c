@@ -5722,6 +5722,23 @@ keyboard_at_invalid_cmd(atkbc_dev_t *dev)
     kbc_at_dev_queue_add(dev, inv_cmd_response, 0);
 }
 
+/* The enhanced keyboard used by the 101/102/106-key layouts implements the
+   PS/2 command set (F0 to select the scan code set, and the set 3 only F7-FA
+   key type commands) even when it is fitted with an AT connector; the 84-key
+   AT keyboard does not (IBM Keyboards (101- and 102-Key), October 1990,
+   p. 21, 23 and 34). */
+static int
+keyboard_at_has_ps2_commands(atkbc_dev_t *dev)
+{
+    if (dev->type & FLAG_PS2_KBD)
+        return 1;
+
+    if (dev->lk250 || (dev->type & FLAG_AX))
+        return 0;
+
+    return ((dev->type & FLAG_TYPE_MASK) > KBD_84_KEY);
+}
+
 static void
 keyboard_at_write(void *priv)
 {
@@ -5758,12 +5775,14 @@ keyboard_at_write(void *priv)
                     case 0x8a:
                         /* Sets 81h/82h/8Ah only exist on the Japanese 5576
                            keyboards; other keyboards answer resend and keep
-                           their current set (J-DOS then reports BIOS-102). */
+                           their current set (J-DOS then reports BIOS-102).
+                           Go back to scanning instead of waiting for another
+                           parameter: the host may give up after the resend
+                           (MS-DOS KEYB tries F0 82 three times, then sends
+                           nothing more), which would leave the keyboard dead. */
                         if ((val >= 0x81) && !dev->ps55) {
                             kbc_at_dev_queue_add(dev, 0xfe, 0); /* Resend */
                             keyboard_at_log("%s: Set scan code set [%02X] not supported - resend\n", dev->name, val);
-                            dev->flags |= FLAG_CTRLDAT;
-                            dev->state = DEV_STATE_MAIN_WANT_IN;
                             break;
                         }
                         kbc_at_dev_queue_add(dev, 0xfa, 0); /* ACK */
@@ -5816,6 +5835,20 @@ keyboard_at_write(void *priv)
         }
 
         switch (val) {
+            case 0xab: /* Request Keyboard ID */
+                if (dev->lk250) {
+                    /* The LK250 answers ABh with two bytes and no ACK: the version,
+                       then the mode (01h industry standard, 02h DIGITAL extended)
+                       (TRM 8-22/8-23). The VAXmate BIOS takes a valid answer as
+                       "clock present" when DOS asks through INT 15 AH=D0h, so
+                       without it the DOS date stays at 1-01-1980. */
+                    keyboard_at_log("%s: LK250: request keyboard ID\n", dev->name);
+                    kbc_at_dev_queue_add(dev, 0x01, 0); /* version */
+                    kbc_at_dev_queue_add(dev, 0x01, 0); /* industry standard mode */
+                } else
+                    kbc_at_dev_queue_add(dev, 0xfe, 0); /* Resend, as the default case. */
+                break;
+
             case 0xed: /* set/reset LEDs */
                 if ((dev->flags & FLAG_CTRLDAT) && (dev->command == 0xed))
                     keyboard_scan = 1;
@@ -5838,7 +5871,7 @@ keyboard_at_write(void *priv)
                 break;
 
             case 0xf0: /* get/set scan code set */
-                if (dev->type & FLAG_PS2_KBD) {
+                if (keyboard_at_has_ps2_commands(dev)) {
                     dev->command = val;
                     keyboard_at_log("%s: scan code set\n", dev->name);
                     dev->flags |= FLAG_CTRLDAT;
@@ -5904,7 +5937,7 @@ keyboard_at_write(void *priv)
                 break;
 
             case 0xf7: /* set all keys to repeat */
-                if (dev->type & FLAG_PS2_KBD) {
+                if (keyboard_at_has_ps2_commands(dev)) {
                     keyboard_at_log("%s: set all keys to repeat\n", dev->name);
                     kbc_at_dev_queue_add(dev, 0xfa, 0);
                     keyboard_set3_all_break = 1;
@@ -5913,7 +5946,7 @@ keyboard_at_write(void *priv)
                 break;
 
             case 0xf8: /* set all keys to give make/break codes */
-                if (dev->type & FLAG_PS2_KBD) {
+                if (keyboard_at_has_ps2_commands(dev)) {
                     keyboard_at_log("%s: set all keys to give make/break codes\n", dev->name);
                     kbc_at_dev_queue_add(dev, 0xfa, 0);
                     keyboard_set3_all_break = 1;
@@ -5922,7 +5955,7 @@ keyboard_at_write(void *priv)
                 break;
 
             case 0xf9: /* set all keys to give make codes only */
-                if (dev->type & FLAG_PS2_KBD) {
+                if (keyboard_at_has_ps2_commands(dev)) {
                     keyboard_at_log("%s: set all keys to give make codes only\n", dev->name);
                     kbc_at_dev_queue_add(dev, 0xfa, 0);
                     keyboard_set3_all_break = 0;
@@ -5931,7 +5964,7 @@ keyboard_at_write(void *priv)
                 break;
 
             case 0xfa: /* set all keys to repeat and give make/break codes */
-                if (dev->type & FLAG_PS2_KBD) {
+                if (keyboard_at_has_ps2_commands(dev)) {
                     keyboard_at_log("%s: set all keys to repeat and give make/break codes\n", dev->name);
                     kbc_at_dev_queue_add(dev, 0xfa, 0);
                     keyboard_set3_all_repeat = 1;
@@ -6030,10 +6063,10 @@ keyboard_at_init(const device_t *info)
        Key 56  = Japanese key next to right shift, scan code:              5C (Backslash 73);
        Key 59  = Japanese key between left Ctrl and left Alt, scan code:   85 (Muhenkan 7B);
        Key 63  = Japanese key between right Ctrl and right Alt, scan code: 86 (Henkan/Zenkouho 79);
-       Key 65? = Japanese key between right Ctrl and right Alt, scan code: 87 (Hiragana/Katakana 70).
-     */
-    dev->type = (info->local & ~FLAG_PS55_KBD) | device_get_config_int("keys");
-    dev->ps55 = !!(info->local & FLAG_PS55_KBD);
+       Key 65? = Japanese key between right Ctrl and right Alt, scan code: 87 (Hiragana/Katakana 70). */
+    dev->type  = (info->local & ~(FLAG_PS55_KBD | FLAG_LK250_KBD)) | device_get_config_int("keys");
+    dev->ps55  = !!(info->local & FLAG_PS55_KBD);
+    dev->lk250 = !!(info->local & FLAG_LK250_KBD);
 
     /*
         We assume that the IBM PS/55 machine uses the 5576-002 keyboard (JP/CN layout) here.
@@ -6062,7 +6095,7 @@ keyboard_at_init(const device_t *info)
     SavedKbd = dev;
     keyboard_update_states(0, 0, 0, 0);
 
-    inv_cmd_response = (dev->type & FLAG_PS2_KBD) ? 0xfe : 0xfa;
+    inv_cmd_response = keyboard_at_has_ps2_commands(dev) ? 0xfe : 0xfa;
 
     is_special = 0;
 
@@ -6231,12 +6264,12 @@ static const device_config_t keyboard_at_config[] = {
         .file_filter    = NULL,
         .spinner        = { 0 },
         .selection      = {
-            { .description = "84",          .value = KBD_84_KEY  },
-            { .description = "101 (ANSI)",  .value = KBD_101_KEY },
-            { .description = "102 (ISO)",   .value = KBD_102_KEY },
-            { .description = "106 (JIS)",   .value = KBD_JIS     },
-            { .description = "103 (KSC)",   .value = KBD_KSC     },
-            { .description = "104 (ABNT2)", .value = KBD_ABNT2   }
+            { .description = "84 (Model F)", .value = KBD_84_KEY  },
+            { .description = "101 (ANSI)",   .value = KBD_101_KEY },
+            { .description = "102 (ISO)",    .value = KBD_102_KEY },
+            { .description = "106 (JIS)",    .value = KBD_JIS     },
+            { .description = "103 (KSC)",    .value = KBD_KSC     },
+            { .description = "104 (ABNT2)",  .value = KBD_ABNT2   }
         },
         .bios           = { { 0 } }
     },
@@ -6318,6 +6351,20 @@ const device_t keyboard_ps55_device = {
     .internal_name = "keyboard_ps55",
     .flags         = DEVICE_AT_KBC | DEVICE_PS2_KBC,
     .local         = FLAG_PS2_KBD | FLAG_PS55_KBD | KBD_JIS,
+    .init          = keyboard_at_init,
+    .close         = keyboard_at_close,
+    .reset         = NULL,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = NULL
+};
+
+const device_t keyboard_lk250_device = {
+    .name          = "DEC LK250 Keyboard",
+    .internal_name = "keyboard_lk250",
+    .flags         = DEVICE_AT_KBC,
+    .local         = FLAG_LK250_KBD | KBD_102_KEY,
     .init          = keyboard_at_init,
     .close         = keyboard_at_close,
     .reset         = NULL,

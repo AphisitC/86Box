@@ -50,12 +50,12 @@ uint32_t cr4;
 uint32_t dr[8];
 
 int cpu_debug_regs_486 = 0;
-int cpu_dr_armed       = 0;
+
+/* One cache line, read as two words by the block-to-block transfer */
+cpu_events_t cpu_events __attribute__((aligned(64)));
 
 uint32_t use32;
 int      stack32;
-
-int      cpu_init = 0;
 
 uint32_t *eal_r;
 uint32_t *eal_w;
@@ -73,7 +73,6 @@ extern int      optype;
 extern uint32_t pccache;
 extern int      ioapic_lint1_raise(void);
 
-int      new_ne            = 0;
 int      in_sys            = 0;
 int      unmask_a20_in_smm = 0;
 uint32_t old_rammask       = 0xffffffff;
@@ -83,7 +82,11 @@ int soft_reset_mask = 0;
 int smi_latched = 0;
 int smm_in_hlt  = 0;
 int smi_block   = 0;
-int cpu_halted  = 0;
+
+/* ACPI clock control, see cpu.h (cpu_stpclk and cpu_throttle_run live in
+   cpu_events). */
+int cpu_throttle_period = 8;
+int cpu_throttle_break  = 0;
 
 /* RSM restarted a HLT and a latched SMI is about to be entered. */
 static int smm_rsm_restart = 0;
@@ -584,10 +587,16 @@ prefetch_run(int instr_cycles, int bytes, int modrm, int reads, int reads_l, int
         }
     }
 
+    int pc = cpu_prefetch_cycles;
+    if (!cpu_mca_bus &&
+        (cpu_prefetch_cycles == cpu_rom_prefetch_cycles) &&
+        ((is586 && !cpu_cache_int_enabled) || (is_p6 && !(msr.mtrr_deftype & 0x800))))
+        pc *= cpu_prefetch_width;
+
     /* Fill up prefetch queue */
     while (prefetch_bytes < 0) {
         prefetch_bytes += cpu_prefetch_width;
-        cycles -= cpu_prefetch_cycles;
+        cycles -= pc;
     }
 
     /* Subtract cycles used for memory access by instruction */
@@ -595,7 +604,7 @@ prefetch_run(int instr_cycles, int bytes, int modrm, int reads, int reads_l, int
 
     while (instr_cycles >= cpu_prefetch_cycles) {
         prefetch_bytes += cpu_prefetch_width;
-        instr_cycles -= cpu_prefetch_cycles;
+        instr_cycles -= pc;
     }
 
     prefetch_prefixes = 0;
@@ -680,6 +689,8 @@ smm_seg_load(x86seg *s)
             cpu_cur_status |= CPU_STATUS_NOTFLATSS;
         set_stack32((s->ar_high & 0x40) ? 1 : 0);
     }
+    cpu_set_wide_status(s);
+    cpu_mark_64k_status(s);
 }
 
 static void
@@ -1329,16 +1340,43 @@ gxm_smm_load_cs(uint32_t addr, x86seg *seg)
         cpu_cur_status &= ~CPU_STATUS_USE32;
 }
 
-static void
-smram_save_state_cyrix(uint32_t *saved_state, int in_hlt)
+/* The opcode of the instruction at CS:oldpc past its prefixes, and whether
+   one of them was REP. Read from memory: opcode and rep_op are only what the
+   interpreter last decoded, which compiled code does not update, and rep_op
+   is the byte after F3h, an operand size prefix in F3 66 6F. */
+static uint8_t
+cyrix_smm_decode_op(int *is_rep)
 {
-    /* The I/O instruction, prefixes stepped over: a REP INS or OUTS is the
-       one whose ESI or EDI the header carries. P is for an SMI one of its
-       I/O cycles asserted (3.11.5): an SMI# that comes in on its own, a
-       timer's, is taken between its iterations as well, and a handler
-       told P would take it for a trapped cycle to repeat. */
-    const uint8_t op  = ((opcode == 0xf2) || (opcode == 0xf3)) ? rep_op : opcode;
-    const int     rep = io_cycle_smi && (op != opcode) && (op >= 0x6c) && (op <= 0x6f);
+    const uint8_t old_abrt = cpu_state.abrt;
+    uint8_t       op       = 0x00;
+
+    *is_rep = 0;
+    for (int c = 0; c < 15; c++) {
+        op = readmembl(cs + ((cpu_state.oldpc + c) & (use32 ? 0xffffffff : 0xffff)));
+        if (cpu_state.abrt)
+            break;
+        if ((op == 0xf2) || (op == 0xf3))
+            *is_rep = 1;
+        else if ((op != 0x26) && (op != 0x2e) && (op != 0x36) && (op != 0x3e) && (op != 0x64) &&
+                 (op != 0x65) && (op != 0x66) && (op != 0x67) && (op != 0xf0))
+            break;
+    }
+    cpu_state.abrt = old_abrt;
+
+    return op;
+}
+
+/* op and is_rep: the I/O instruction, prefixes stepped over, as
+   cyrix_smm_decode_op() read it before SMRAM was mapped in. */
+static void
+smram_save_state_cyrix(uint32_t *saved_state, int in_hlt, uint8_t op, int is_rep)
+{
+    /* A REP INS or OUTS is the one whose ESI or EDI the header carries.
+       P is for an SMI one of its I/O cycles asserted (3.11.5): an SMI# that
+       comes in on its own, a timer's, is taken between its iterations as
+       well, and a handler told P would take it for a trapped cycle to
+       repeat. */
+    const int rep = io_cycle_smi && is_rep && (op >= 0x6c) && (op <= 0x6f);
 
     saved_state[0] = dr[7];
     saved_state[1] = cpu_state.flags | (cpu_state.eflags << 16);
@@ -1488,11 +1526,32 @@ enter_smm(int in_hlt)
     x386_common_log("EAX = %08X, EBX = %08X, ECX = %08X, EDX = %08X, ESI = %08X, EDI = %08X, ESP = %08X, EBP = %08X\n",
                     EAX, EBX, ECX, EDX, ESI, EDI, ESP, EBP);
 
+    /* The Cyrix header's I/O instruction is read at CS:oldpc as the code
+       that ran saw it, before SMRAM is mapped in over it (in SMM already,
+       for a nested SMI, the map does not change). */
+    int     cyrix_rep = 0;
+    uint8_t cyrix_op  = 0x00;
+    if (is_cxsmm && io_cycle_smi)
+        cyrix_op = cyrix_smm_decode_op(&cyrix_rep);
+
     flags_rebuild();
     if (!nested) {
         in_smm = 1;
         smram_backup_all();
         smram_recalc_all(0);
+
+        /* A20 is unmasked before the save state is written: SMRAM above
+           1 MiB with bit 20 set in its address (e.g. FFFE0000h) must be
+           reachable for an SMI raised with the A20 gate closed. RSM puts
+           the mask back after it has read the save state (leave_smm()). */
+        if (unmask_a20_in_smm) {
+            old_rammask = rammask;
+            rammask     = cpu_16bitbus ? 0xFFFFFF : 0xFFFFFFFF;
+            if (is6117 || is386ex)
+                rammask |= 0x3000000;
+
+            flushmmucache();
+        }
     }
 
     if (is_cxsmm) {
@@ -1504,7 +1563,7 @@ enter_smm(int in_hlt)
     memset(saved_state, 0x00, SMM_SAVE_STATE_MAP_SIZE * sizeof(uint32_t));
 
     if (is_cxsmm) /* Cx6x86 */
-        smram_save_state_cyrix(saved_state, in_hlt);
+        smram_save_state_cyrix(saved_state, in_hlt, cyrix_op, cyrix_rep);
     else if (is_pentium || is_am486) /* Am486 / 5x86 / Intel P5 (Pentium) */
         smram_save_state_p5(saved_state, in_hlt);
     else if (is_k5 || is_k6) /* AMD K5 and K6 */
@@ -1626,15 +1685,6 @@ enter_smm(int in_hlt)
 
     smm_in_hlt = in_hlt;
 
-    if (unmask_a20_in_smm && !nested) {
-        old_rammask = rammask;
-        rammask     = cpu_16bitbus ? 0xFFFFFF : 0xFFFFFFFF;
-        if (is6117 || is386ex)
-            rammask |= 0x3000000;
-
-        flushmmucache();
-    }
-
     oldcpl = 0;
 
     cpu_cur_status &= ~(CPU_STATUS_PMODE | CPU_STATUS_V86);
@@ -1739,6 +1789,8 @@ leave_smm(void)
     }
     cpl_override = 0;
 
+    /* The save state was read above with A20 still unmasked, as it was
+       written (enter_smm()); only now does the mask go back. */
     if (unmask_a20_in_smm && !nested) {
         rammask = old_rammask;
 
@@ -1794,11 +1846,10 @@ leave_smm(void)
     cpu_386_flags_extract();
     cpu_cur_status &= ~(CPU_STATUS_PMODE | CPU_STATUS_V86);
     cpu_cur_status &= ~CPU_STATUS_SMM;
-    if (cr0 & 1) {
+    if (cr0 & 1)
         cpu_cur_status |= CPU_STATUS_PMODE;
-        if (cpu_state.eflags & VM_FLAG)
-            cpu_cur_status |= CPU_STATUS_V86;
-    }
+    cpu_set_v86_status();
+    cpu_update_64k_status();
 
     nmi_mask = 1;
 
@@ -1847,10 +1898,17 @@ leave_smm(void)
    as it always did: discarding those recorded them afresh on every run. */
 int codegen_record_faulted;
 
+/* Set while x86_int() delivers an external interrupt, whose vector is never
+   a fault whatever its number */
+int x86_int_external = 0;
+
 void
 x86_int(int num)
 {
     uint32_t addr;
+    /* #DE, #BR, #UD, #NM and #MF are faults: as for those x86_doabrt()
+       delivers, the EFLAGS image the handler gets has RF set */
+    const int fault = !x86_int_external && ((num == 0) || (num == 5) || (num == 6) || (num == 7) || (num == 16));
 
     /* A fault did not retire the instruction being stepped. Drop its
        pending debug trap before entering the handler; a task switch may
@@ -1868,15 +1926,19 @@ x86_int(int num)
     if (num == 1)
         dr[7] &= ~0x2000;
 
-    if (msw & 1)
+    if (msw & 1) {
+        if (fault)
+            cpu_state.eflags |= RF_FLAG;
         cpu_use_exec ? pmodeint(num, 0) : pmodeint_2386(num, 0);
-    else {
+        if (fault)
+            cpu_state.eflags &= ~RF_FLAG;
+    } else {
         addr = (num << 2) + idt.base;
 
         if ((num << 2UL) + 3UL > idt.limit) {
             if (idt.limit < 35) {
                 cpu_state.abrt = 0;
-                softresetx86();
+                softresetx86_from(SOFT_RESET_SHUTDOWN);
                 cpu_set_edx();
 #ifdef ENABLE_386_COMMON_LOG
                 x386_common_log("Triple fault in real mode - reset\n");
@@ -2202,11 +2264,11 @@ sysenter(UNUSED(uint32_t fetchdat))
     cpu_state.seg_ss.ar_high    = 0xcf;
     cpu_state.seg_ss.checked    = 1;
 #ifdef USE_DYNAREC
-    codegen_flat_ss = 0;
+    codegen_flat_ss = codegen_wide_ss = 0;
 #endif
 
-    cpu_cur_status &= ~(CPU_STATUS_NOTFLATSS | CPU_STATUS_V86);
-    cpu_cur_status |= (CPU_STATUS_USE32 | CPU_STATUS_STACK32 /* | CPU_STATUS_PMODE*/);
+    cpu_cur_status &= ~(CPU_STATUS_NOTFLATSS | CPU_STATUS_NOTWIDESS | CPU_STATUS_V86);
+    cpu_cur_status |= (CPU_STATUS_USE32 | CPU_STATUS_STACK32 | CPU_STATUS_NOT64K /* | CPU_STATUS_PMODE*/);
     set_use32(1);
     set_stack32(1);
 
@@ -2277,6 +2339,7 @@ sysexit(UNUSED(uint32_t fetchdat))
     cpu_state.seg_cs.checked    = 1;
     oldcpl                      = 3;
 
+    cpu_cur_status |= CPU_STATUS_NOT64K;
     cpu_state.seg_ss.seg        = (((msr.sysenter_cs + 24) & 0xfffc) | 3);
     cpu_state.seg_ss.base       = 0;
     cpu_state.seg_ss.limit_low  = 0;
@@ -2286,12 +2349,12 @@ sysexit(UNUSED(uint32_t fetchdat))
     cpu_state.seg_ss.ar_high    = 0xcf;
     cpu_state.seg_ss.checked    = 1;
 #ifdef USE_DYNAREC
-    codegen_flat_ss = 0;
+    codegen_flat_ss = codegen_wide_ss = 0;
 #endif
 
-    cpu_cur_status &= ~(CPU_STATUS_NOTFLATSS /* | CPU_STATUS_V86*/);
+    cpu_cur_status &= ~(CPU_STATUS_NOTFLATSS | CPU_STATUS_NOTWIDESS /* | CPU_STATUS_V86*/);
     cpu_cur_status |= (CPU_STATUS_USE32 | CPU_STATUS_STACK32 | CPU_STATUS_PMODE);
-    flushmmucache_nopc();
+    flushmmucache_ring3();
     set_use32(1);
     set_stack32(1);
 
@@ -2345,11 +2408,11 @@ syscall_op(UNUSED(uint32_t fetchdat))
     cpu_state.seg_ss.ar_high    = 0xcf;
     cpu_state.seg_ss.checked    = 1;
 #ifdef USE_DYNAREC
-    codegen_flat_ss = 0;
+    codegen_flat_ss = codegen_wide_ss = 0;
 #endif
 
-    cpu_cur_status &= ~(CPU_STATUS_NOTFLATSS | CPU_STATUS_V86);
-    cpu_cur_status |= (CPU_STATUS_USE32 | CPU_STATUS_STACK32 | CPU_STATUS_PMODE);
+    cpu_cur_status &= ~(CPU_STATUS_NOTFLATSS | CPU_STATUS_NOTWIDESS | CPU_STATUS_V86);
+    cpu_cur_status |= (CPU_STATUS_USE32 | CPU_STATUS_STACK32 | CPU_STATUS_PMODE | CPU_STATUS_NOT64K);
     set_use32(1);
     set_stack32(1);
 
@@ -2394,6 +2457,7 @@ sysret(UNUSED(uint32_t fetchdat))
     oldcpl                      = 3;
 
     /* SS */
+    cpu_cur_status |= CPU_STATUS_NOT64K;
     SS                          = ((AMD_SYSRET_SB + 8) & 0xfffc) | 3;
     cpu_state.seg_ss.base       = 0;
     cpu_state.seg_ss.limit_low  = 0;
@@ -2403,12 +2467,12 @@ sysret(UNUSED(uint32_t fetchdat))
     cpu_state.seg_ss.ar_high    = 0xcf;
     cpu_state.seg_ss.checked    = 1;
 #ifdef USE_DYNAREC
-    codegen_flat_ss = 0;
+    codegen_flat_ss = codegen_wide_ss = 0;
 #endif
 
-    cpu_cur_status &= ~(CPU_STATUS_NOTFLATSS /* | CPU_STATUS_V86*/);
+    cpu_cur_status &= ~(CPU_STATUS_NOTFLATSS | CPU_STATUS_NOTWIDESS /* | CPU_STATUS_V86*/);
     cpu_cur_status |= (CPU_STATUS_USE32 | CPU_STATUS_STACK32 | CPU_STATUS_PMODE);
-    flushmmucache_nopc();
+    flushmmucache_ring3();
     set_use32(1);
     set_stack32(1);
 

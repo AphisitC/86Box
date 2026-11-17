@@ -11,6 +11,7 @@
  * Authors: RichardG, <richardg867@gmail.com>
  *
  *          Copyright 2021-2025 RichardG.
+ *          Copyright 2026 Xeon3D.
  */
 #include <stdarg.h>
 #include <stdint.h>
@@ -155,13 +156,16 @@ ac97_codec_log(const char *fmt, ...)
 #    define ac97_codec_log(fmt, ...)
 #endif
 
+/* AC'97 volume and gain controls step 1.5 dB (master 0 to -94.5 dB, the 5-bit
+   gains +12 to -34.5 dB with 08h at 0 dB), not 2 dB as the AK4531 of the
+   ES1370 does: 32767 * 10^((n - 63) * 1.5 / 20), index 63 being 0 dB. */
 static const int32_t codec_attn[] = {
     // clang-format off
-        0,     0,     0,     0,      0,      0,      0,      0,    0,    0,     0,     0,     0,     0,     0,     0,
-        1,     1,     1,     1,      2,      2,      2,      3,    4,    5,     6,     8,    10,    12,    16,    20,
-       25,    32,    41,    51,     65,     82,    103,    130,  164,  206,   260,   327,   412,   519,   653,   822,
-     1036,  1304,  1641,  2067,   2602,   3276,   4125,   5192, 6537, 8230, 10362, 13044, 16422, 20674, 26027, 32767,
-    41305, 52068, 65636, 82739, 104299, 131477, 165737, 208925
+        1,     1,     1,     1,     1,     1,     2,     2,     2,     3,     3,     4,     5,     6,     7,     8,
+       10,    12,    14,    16,    20,    23,    28,    33,    39,    46,    55,    65,    78,    92,   110,   130,
+      155,   184,   219,   260,   309,   368,   437,   519,   617,   734,   872,  1036,  1232,  1464,  1740,  2067,
+     2457,  2920,  3471,  4125,  4903,  5827,  6925,  8231,  9782, 11626, 13818, 16422, 19518, 23197, 27570, 32767,
+    38944, 46285, 55009, 65379, 77703, 92350, 109758, 130448
     // clang-format on
 };
 
@@ -368,31 +372,37 @@ line_gain:
             i |= (ac97_codecs[dev->model].eascr_mask << 11) & 0x7800;
             val = (val & i) | (prev & ~i);
 
-            /* Reset DAC sample rates to 48 KHz (96 KHz with DRA) if VRA is being cleared. */
+            /* Reset DAC and PCM ADC sample rates to 48 KHz (96 KHz with DRA) if VRA is being cleared.
+               VRA covers the PCM L/R ADC (32h) too, per AC'97 2.x; VRM only the Mic ADC (34h). */
             if (!(val & AC97_VRA)) {
-                for (i = 0x2c; i <= 0x30; i += 2)
+                for (i = 0x2c; i <= 0x32; i += 2)
                     dev->regs[i >> 1] = 48000;
             }
 
-            /* Reset ADC sample rates to 48 KHz if VRM is being cleared. */
-            if (!(val & AC97_VRM)) {
-                for (i = 0x32; i <= 0x34; i += 2)
-                    dev->regs[i >> 1] = 48000;
-            }
+            /* Reset the Mic ADC sample rate to 48 KHz if VRM is being cleared. */
+            if (!(val & AC97_VRM))
+                dev->regs[0x34 >> 1] = 48000;
             break;
 
         case 0x2c: /* PCM Front DAC Rate */
         case 0x32: /* PCM L/R ADC Rate */
 rate_vrx:          /* Writable only if VRA/VRM is set. */
-            i = (reg >= 0x32) ? AC97_VRM : AC97_VRA;
+            i = (reg >= 0x34) ? AC97_VRM : AC97_VRA;
             if (!(ac97_codecs[dev->model].extid_flags & i))
                 return;
 rate:
-            /* Limit to supported sample rate range. */
-            if (val < ac97_codecs[dev->model].min_rate)
-                val = ac97_codecs[dev->model].min_rate;
-            else if (val > ac97_codecs[dev->model].max_rate)
-                val = ac97_codecs[dev->model].max_rate;
+            /* Limit to supported sample rate range. A codec without a range
+               of its own (the ICE1232 / VT1611A) takes AC'97's 8 to 48 kHz;
+               with none, every rate written became 0. */
+            {
+                const uint32_t min_rate = ac97_codecs[dev->model].min_rate ? ac97_codecs[dev->model].min_rate : 8000;
+                const uint32_t max_rate = ac97_codecs[dev->model].max_rate ? ac97_codecs[dev->model].max_rate : 48000;
+
+                if (val < min_rate)
+                    val = min_rate;
+                else if (val > max_rate)
+                    val = max_rate;
+            }
             break;
 
         case 0x2e: /* PCM Surround DAC Rate */
@@ -880,7 +890,7 @@ const device_t ak4540_device = {
 const device_t alc100_device = {
     .name          = "Avance Logic ALC100",
     .internal_name = "alc100",
-    .flags         = DEVICE_AC97,
+    .flags         = DEVICE_AC97 | DEVICE_AUDIO_IN, /* see ice1232_device */
     .local         = AC97_CODEC_ALC100,
     .init          = ac97_codec_init,
     .close         = ac97_codec_close,
@@ -922,7 +932,11 @@ const device_t cs4297a_device = {
 const device_t ice1232_device = {
     .name          = "ICEnsemble ICE1232 / VIA VT1611A",
     .internal_name = "ice1232",
-    .flags         = DEVICE_AC97,
+    /* audio input -- this, the ALC100 and the WM9701A are the
+       on-board sound (snd_device) of the VIA 686 boards, whose AC'97
+       controller records through them; Settings enables audio input for
+       the machine's internal sound by this flag. */
+    .flags         = DEVICE_AC97 | DEVICE_AUDIO_IN,
     .local         = AC97_CODEC_ICE1232,
     .init          = ac97_codec_init,
     .close         = ac97_codec_close,
@@ -992,7 +1006,7 @@ const device_t w83971d_device = {
 const device_t wm9701a_device = {
     .name          = "Wolfson WM9701A",
     .internal_name = "wm9701a",
-    .flags         = DEVICE_AC97,
+    .flags         = DEVICE_AC97 | DEVICE_AUDIO_IN, /* see ice1232_device */
     .local         = AC97_CODEC_WM9701A,
     .init          = ac97_codec_init,
     .close         = ac97_codec_close,

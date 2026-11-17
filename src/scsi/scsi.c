@@ -46,6 +46,9 @@
 #include <86box/scsi_spock.h>
 #include <86box/mem.h>
 #include <86box/usb.h>
+#include <86box/timer.h>
+#include <86box/thread.h>
+#include <86box/network.h>
 
 int scsi_card_current[SCSI_CARD_MAX] = { 0, 0, 0, 0 };
 double scsi_bus_speed[SCSI_BUS_MAX] = { 0.0, 0.0, 0.0, 0.0 };
@@ -59,6 +62,7 @@ typedef const struct {
 static SCSI_CARD scsi_cards[] = {
     // clang-format off
     { &device_none,              },
+    { &device_internal,          },
     /* ISA */
     { &scsi_lcs6821n_device,     },
     { &scsi_rt1000b_device,      },
@@ -100,6 +104,9 @@ static SCSI_CARD scsi_cards[] = {
     { &aha2940_pci_device,       },
     { &aha2940u_pci_device,      },
     { &aha2944uw_pci_device,     },
+#ifdef USE_AIC7890
+    { &aha2940u2w_pci_device,    },
+#endif /* USE_AIC7890 */
     { &am53c974_pci_device,      },
     { &am53c974a_pci_device,     },
     { &buslogic_958d_pci_device, },
@@ -192,7 +199,7 @@ scsi_card_init(void)
            bus left. */
     if (max > 0) {
         for (int i = 0; i < max; i++) {
-            if ((scsi_card_current[i] > 0) && scsi_cards[scsi_card_current[i]].device)
+            if ((scsi_card_current[i] > SCSI_CARD_INTERNAL) && scsi_cards[scsi_card_current[i]].device)
                 device_add_inst(scsi_cards[scsi_card_current[i]].device, i + 1);
         }
     }
@@ -237,7 +244,7 @@ scsi_plan_take(bus_owner_t owners[SCSI_BUS_MAX], int *next, int buses, const dev
 }
 
 int
-scsi_plan(bus_owner_t owners[SCSI_BUS_MAX], int mach, const int snd[], const int scsi[], int msd)
+scsi_plan(bus_owner_t owners[SCSI_BUS_MAX], int mach, const int snd[], const int net[], const int scsi[], int msd)
 {
     const machine_t *m    = &machines[mach];
     int              next = 0;
@@ -245,9 +252,12 @@ scsi_plan(bus_owner_t owners[SCSI_BUS_MAX], int mach, const int snd[], const int
     memset(owners, 0, SCSI_BUS_MAX * sizeof(bus_owner_t));
 
     /* In the order they start, each taking the next bus: the machine's own
-       SCSI, its sound, the sound cards, the SCSI cards, then the USB mass
-       storage device, which bridges one bus. */
-    scsi_plan_take(owners, &next, scsi_plan_buses(m->scsi_device, 1, 1), m->scsi_device, 1, 1);
+       SCSI, its sound, the sound cards, the network cards (the PCnet-SCSI), 
+       the SCSI cards, then the USB mass storage device, which bridges one bus.
+       The machine's own SCSI is only there when the Internal entry is chosen
+       for the first card. */
+    if ((scsi[0] == SCSI_CARD_INTERNAL) && (m->scsi_device != NULL))
+      scsi_plan_take(owners, &next, scsi_plan_buses(m->scsi_device, 1, 1), m->scsi_device, 1, 1);
     if ((snd[0] == SOUND_INTERNAL) && (m->snd_device != NULL))
         scsi_plan_take(owners, &next, scsi_plan_buses(m->snd_device, 1, 0), m->snd_device, 1, 1);
     for (int i = 0; i < SOUND_CARD_MAX; i++) {
@@ -257,8 +267,22 @@ scsi_plan(bus_owner_t owners[SCSI_BUS_MAX], int mach, const int snd[], const int
             scsi_plan_take(owners, &next, scsi_plan_buses(dev, i + 1, 0), dev, i + 1, 0);
         }
     }
+    for (int i = 0; i < NET_CARD_MAX; i++) {
+        if (net[i] > NET_INTERNAL) {
+            const device_t *dev = network_card_getdevice(net[i]);
+
+            scsi_plan_take(owners, &next, scsi_plan_buses(dev, i + 1, 0), dev, i + 1, 0);
+        }
+    }
+    for (int i = 0; i < NET_CARD_MAX; i++) {
+        if (net[i] > NET_INTERNAL) {
+            const device_t *dev = network_card_getdevice(net[i]);
+
+            scsi_plan_take(owners, &next, scsi_plan_buses(dev, i + 1, 0), dev, i + 1, 0);
+        }
+    }
     for (int i = 0; i < SCSI_CARD_MAX; i++) {
-        if (scsi[i] > 0) {
+        if (scsi[i] > SCSI_CARD_INTERNAL) {
             const device_t *dev = scsi_card_getdevice(scsi[i]);
 
             scsi_plan_take(owners, &next, scsi_plan_buses(dev, i + 1, 1), dev, i + 1, 0);
@@ -277,7 +301,12 @@ void
 scsi_plan_check(void)
 {
     bus_owner_t owners[SCSI_BUS_MAX];
-    const int   planned = scsi_plan(owners, machine, sound_card_current, scsi_card_current, usb_msd_type);
+    int         net[NET_CARD_MAX];
+
+    for (int i = 0; i < NET_CARD_MAX; i++)
+        net[i] = net_cards_conf[i].device_num;
+
+    const int planned = scsi_plan(owners, machine, sound_card_current, net, scsi_card_current, usb_msd_type);
 
     if (planned != next_scsi_bus)
         warning("SCSI: the machine has %i buses, but the settings show %i\n", next_scsi_bus, planned);

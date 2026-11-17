@@ -40,6 +40,7 @@
 #include <86box/timer.h>
 #include <86box/thread.h>
 #include <86box/network.h>
+#include <86box/scsi.h>
 #include <86box/scsi_ncr53c8xx.h>
 
 /* ALi ALADDiN V */
@@ -63,10 +64,10 @@ machine_at_p5a_init(const machine_t *model)
     pci_register_slot(0x0F, PCI_CARD_SOUTHBRIDGE_IDE, 1, 2, 3, 4);
     pci_register_slot(0x03, PCI_CARD_SOUTHBRIDGE_PMU, 1, 2, 3, 4);
     pci_register_slot(0x02, PCI_CARD_SOUTHBRIDGE_USB, 1, 2, 3, 4);
-    pci_register_slot(0x09, PCI_CARD_NORMAL,          4, 1, 2, 3);
-    pci_register_slot(0x0A, PCI_CARD_NORMAL,          3, 4, 1, 2);
-    pci_register_slot(0x0B, PCI_CARD_NORMAL,          2, 3, 4, 1);
     pci_register_slot(0x0C, PCI_CARD_NORMAL,          1, 2, 3, 4);
+    pci_register_slot(0x0B, PCI_CARD_NORMAL,          2, 3, 4, 1);
+    pci_register_slot(0x0A, PCI_CARD_NORMAL,          3, 4, 1, 2);
+    pci_register_slot(0x09, PCI_CARD_NORMAL,          4, 1, 2, 3);
     pci_register_slot(0x0D, PCI_CARD_NORMAL,          4, 1, 2, 3);
     pci_register_slot(0x06, PCI_CARD_SOUND,           3, 4, 1, 2);
 
@@ -198,7 +199,8 @@ machine_at_cobalt3k_init(const machine_t *model)
     device_add(&ali1541_device);
     device_add(&ali1543c_device); /* +0 */
     device_add(&intel_flash_e28f0xx_cobalt3k_device);
-    device_add(machine_get_scsi_device(machine));
+    if ((scsi_card_current[0] == SCSI_CARD_INTERNAL) && machine_get_scsi_device(machine))
+        device_add(machine_get_scsi_device(machine));
     spd_register(SPD_TYPE_SDRAM, 0x3, 256);
     device_add(&lm77_0_48_device);
     device_add_params(&hd44780_cobalt3k_device, (void *) (uintptr_t) model->device->local);
@@ -282,6 +284,10 @@ machine_at_gwlucas_init(const machine_t *model)
         device_add(machine_get_snd_device(machine));
         device_add(&cs4297_device);
     }
+
+    /* The on-board video; its BIOS is in the system BIOS. */
+    if ((gfxcard[0] == VID_INTERNAL) && machine_get_vid_device(machine))
+        device_add(machine_get_vid_device(machine));
 
     return ret;
 }
@@ -1113,9 +1119,9 @@ machine_at_ga5smm_init(const machine_t *model)
     machine_at_common_init(model);
 
     pci_init(PCI_CONFIG_TYPE_1);
-    pci_register_slot(0x00, PCI_CARD_NORTHBRIDGE,     1, 2, 3, 4);
+    pci_register_slot(0x00, PCI_CARD_NORTHBRIDGE,     0, 0, 0, 0);
     pci_register_slot(0x01, PCI_CARD_SOUTHBRIDGE,     0, 0, 0, 0);
-    pci_register_slot(0x02, PCI_CARD_AGPBRIDGE,       0, 0, 0, 0);
+    pci_register_slot(0x02, PCI_CARD_AGPBRIDGE,       1, 2, 3, 4);
     pci_register_slot(0x09, PCI_CARD_NORMAL,          1, 2, 3, 4);
     pci_register_slot(0x0B, PCI_CARD_NORMAL,          2, 3, 4, 1);
     pci_register_slot(0x0D, PCI_CARD_NORMAL,          3, 4, 1, 2);
@@ -1154,9 +1160,9 @@ machine_at_aptiva2187_init(const machine_t *model)
     pci_register_slot(0x02, PCI_CARD_AGPBRIDGE,       0, 0, 0, 0);
     pci_register_slot(0x09, PCI_CARD_NORMAL,          1, 2, 3, 4);
     pci_register_slot(0x0A, PCI_CARD_NORMAL,          2, 3, 4, 1);
-    pci_register_slot(0x0B, PCI_CARD_NORMAL,          3, 4, 1, 2);
+    pci_register_slot(0x0F, PCI_CARD_NORMAL,          1, 2, 3, 4);
     pci_register_slot(0x0C, PCI_CARD_NORMAL,          4, 1, 2, 3);
-    pci_register_slot(0x0F, PCI_CARD_SOUND,           1, 2, 3, 4);
+    pci_register_slot(0x0B, PCI_CARD_NORMAL,          3, 4, 1, 2);
 
     device_add(&sis_530_device);
     device_add(&it8661f_device); /* guess */

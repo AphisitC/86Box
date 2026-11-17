@@ -34,6 +34,8 @@ extern "C" {
 #include <86box/machine.h>
 #include <86box/mem.h>
 #include <86box/usb.h>
+#include <86box/thread.h>
+#include <86box/network.h>
 }
 
 #include "qt_settings.hpp"
@@ -49,7 +51,7 @@ void
 Harddrives::populateBuses(QAbstractItemModel *model)
 {
     model->removeRows(0, model->rowCount());
-    model->insertRows(0, 6);
+    model->insertRows(0, 7);
 
     model->setData(model->index(0, 0), "ST-506/ST-412 (MFM/RLL)");
     model->setData(model->index(1, 0), "XTA");
@@ -57,6 +59,7 @@ Harddrives::populateBuses(QAbstractItemModel *model)
     model->setData(model->index(3, 0), "IDE");
     model->setData(model->index(4, 0), "ATAPI");
     model->setData(model->index(5, 0), "SCSI");
+    model->setData(model->index(6, 0), "LPT");
 
     model->setData(model->index(0, 0), HDD_BUS_MFM, Qt::UserRole);
     model->setData(model->index(1, 0), HDD_BUS_XTA, Qt::UserRole);
@@ -64,6 +67,7 @@ Harddrives::populateBuses(QAbstractItemModel *model)
     model->setData(model->index(3, 0), HDD_BUS_IDE, Qt::UserRole);
     model->setData(model->index(4, 0), HDD_BUS_ATAPI, Qt::UserRole);
     model->setData(model->index(5, 0), HDD_BUS_SCSI, Qt::UserRole);
+    model->setData(model->index(6, 0), HDD_BUS_LPT, Qt::UserRole);
 }
 
 void
@@ -126,6 +130,7 @@ Harddrives::populateSpeeds(QAbstractItemModel *model, SettingsCompleter *sc, int
         case HDD_BUS_IDE:
         case HDD_BUS_ATAPI:
         case HDD_BUS_SCSI:
+        case HDD_BUS_LPT:
             num_preset = hdd_preset_get_num();
             break;
 
@@ -144,8 +149,20 @@ Harddrives::populateSpeeds(QAbstractItemModel *model, SettingsCompleter *sc, int
     }
 }
 
+QString
+Harddrives::lptBridgeName(int bridge)
+{
+    return QString(hdd_lpt_bridge_get_name(bridge));
+}
+
+bool
+Harddrives::lptPortEnabled(int port)
+{
+    return (port >= 0) && (port < PARALLEL_MAX) && lpt_ports[port].enabled;
+}
+
 void
-Harddrives::populateBusChannels(QAbstractItemModel *model, int bus, SettingsBusTracking *sbt)
+Harddrives::populateBusChannels(QAbstractItemModel *model, int bus, SettingsBusTracking *sbt, int lptBridges)
 {
     model->removeRows(0, model->rowCount());
 
@@ -161,18 +178,15 @@ Harddrives::populateBusChannels(QAbstractItemModel *model, int bus, SettingsBusT
     int            owned         = 0;
     const bool  is_ide  = (bus == HDD_BUS_IDE) || (bus == HDD_BUS_ATAPI);
     const bool  is_scsi = (bus == HDD_BUS_SCSI);
+    const bool  is_hdc  = (bus == HDD_BUS_MFM) || (bus == HDD_BUS_XTA) || (bus == HDD_BUS_ESDI);
     switch (bus) {
         case HDD_BUS_MFM:
-            busRows = 2;
-            busesToCheck.append(HDD_BUS_MFM);
-            break;
         case HDD_BUS_XTA:
-            busRows = 2;
-            busesToCheck.append(HDD_BUS_XTA);
-            break;
         case HDD_BUS_ESDI:
+            /* The one controller of the bus, to name on its channels. */
+            owned   = hdcPlan(owners, bus);
             busRows = 2;
-            busesToCheck.append(HDD_BUS_ESDI);
+            busesToCheck.append(bus);
             break;
         case HDD_BUS_IDE:
             owned   = idePlan(owners, conflicts, &conflictCount);
@@ -242,6 +256,24 @@ Harddrives::populateBusChannels(QAbstractItemModel *model, int bus, SettingsBusT
         }
     }
 
+    if ((bus == TAPE_BUS_LPT) && lptBridges) {
+        /* Each port once per bridge; the port is in use either way. */
+        model->insertRows(0, PARALLEL_MAX * HDD_LPT_BRIDGES);
+        for (int i = 0; i < (PARALLEL_MAX * HDD_LPT_BRIDGES); ++i) {
+            const int port   = i / HDD_LPT_BRIDGES;
+            const int bridge = i % HDD_LPT_BRIDGES;
+            auto      idx    = model->index(i, 0);
+
+            model->setData(idx, QString("LPT%1 %2").arg(port + 1).arg(lptBridgeName(bridge)));
+            model->setData(idx, port | (bridge << 2), Qt::UserRole);
+            auto *channelItem = qobject_cast<QStandardItemModel *>(model)->item(i);
+            if (channelItem)
+                channelItem->setEnabled(!channelsInUse.contains(port) && lpt_ports[port].enabled &&
+                                        ((lptBridges != LptBridgesCdrom) || cdrom_lpt_bridge_valid(bridge)));
+        }
+        return;
+    }
+
     model->insertRows(0, busRows);
     for (int i = 0; i < busRows; ++i) {
         auto idx = model->index(i, 0);
@@ -251,6 +283,8 @@ Harddrives::populateBusChannels(QAbstractItemModel *model, int bus, SettingsBusT
             model->setData(idx, QString("%1:%2 %3").arg(i >> 1).arg(i & 1).arg(ownerName(i >> 1, owners, owned, conflicts, conflictCount)));
         else if (is_scsi)
             model->setData(idx, QString("%1:%2 %3").arg(i >> 4).arg(i & 15, 2, 10, QChar('0')).arg(ownerName(i >> 4, owners, owned)));
+        else if (is_hdc)
+            model->setData(idx, QString("%1:%2 %3").arg(i >> 1).arg(i & 1).arg(ownerName(i >> 1, owners, owned)));
         else
             model->setData(idx, QString("%1:%2").arg(i >> shifter).arg(i & orer, subChannelWidth, 10, QChar('0')));
         model->setData(idx, ((i >> shifter) << shifter) | (i & orer), Qt::UserRole);
@@ -291,14 +325,16 @@ Harddrives::BusChannelName(uint8_t bus, uint8_t channel)
             busName = QString(QObject::tr("Disabled"));
             break;
         case HDD_BUS_MFM:
-            busName = QString("MFM/RLL (%1:%2)").arg(channel >> 1).arg(channel & 1);
-            break;
         case HDD_BUS_XTA:
-            busName = QString("XTA (%1:%2)").arg(channel >> 1).arg(channel & 1);
+        case HDD_BUS_ESDI: {
+            bus_owner_t owner;
+            const int   owned = hdcPlan(&owner, bus);
+
+            busName = QString("%1 %2:%3 %4").arg((bus == HDD_BUS_MFM) ? "MFM/RLL" : ((bus == HDD_BUS_XTA) ? "XTA" : "ESDI"))
+                          .arg(channel >> 1).arg(channel & 1)
+                          .arg(ownerName(channel >> 1, &owner, owned));
             break;
-        case HDD_BUS_ESDI:
-            busName = QString("ESDI (%1:%2)").arg(channel >> 1).arg(channel & 1);
-            break;
+        }
         case HDD_BUS_IDE:
         case HDD_BUS_ATAPI: {
             bus_owner_t owners[IDE_BUS_MAX];
@@ -372,6 +408,26 @@ Harddrives::idePlan(bus_owner_t *owners, ide_conflict_t *conflicts, int *conflic
     return ide_plan(owners, mach, hdc, snd, conflicts, conflictCount);
 }
 
+/* The controller of an MFM/RLL, XTA or ESDI bus for what the settings hold
+   now, as for IDE. Returns 1 with one, else 0. */
+int
+Harddrives::hdcPlan(bus_owner_t *owner, int bus)
+{
+    int mach = machine;
+    int hdc[HDC_MAX];
+
+    for (int i = 0; i < HDC_MAX; i++)
+        hdc[i] = hdc_current[i];
+
+    if (Settings::settings != nullptr) {
+        mach = Settings::settings->currentMachine();
+        for (int i = 0; i < HDC_MAX; i++)
+            hdc[i] = Settings::settings->currentHdc(i);
+    }
+
+    return hdc_plan(owner, bus, mach, hdc);
+}
+
 /* The owner of each SCSI bus for what the settings hold now, as for IDE.
    Returns the number of buses taken. */
 int
@@ -380,12 +436,15 @@ Harddrives::scsiPlan(bus_owner_t *owners)
     int mach = machine;
     int snd[SOUND_CARD_MAX];
     int scsi[SCSI_CARD_MAX];
+    int net[NET_CARD_MAX];
     int msd = usb_msd_type;
 
     for (int i = 0; i < SOUND_CARD_MAX; i++)
         snd[i] = sound_card_current[i];
     for (int i = 0; i < SCSI_CARD_MAX; i++)
         scsi[i] = scsi_card_current[i];
+    for (int i = 0; i < NET_CARD_MAX; i++)
+        net[i] = net_cards_conf[i].device_num;
 
     if (Settings::settings != nullptr) {
         mach = Settings::settings->currentMachine();
@@ -393,10 +452,12 @@ Harddrives::scsiPlan(bus_owner_t *owners)
             snd[i] = Settings::settings->currentSoundCard(i);
         for (int i = 0; i < SCSI_CARD_MAX; i++)
             scsi[i] = Settings::settings->currentScsiCard(i);
+        for (int i = 0; i < NET_CARD_MAX; i++)
+            net[i] = Settings::settings->currentNetCard(i);
         msd = Settings::settings->currentUsbMsd();
     }
 
-    return scsi_plan(owners, mach, snd, scsi, msd);
+    return scsi_plan(owners, mach, snd, net, scsi, msd);
 }
 
 /* A device's label: its short name, with "(Onboard)" for a chip on the

@@ -50,7 +50,8 @@ enum {
     FULLSCR_SCALE_INT,
     FULLSCR_SCALE_INT43,
     FULLSCR_SCALE_CENTER,
-    FULLSCR_SCALE_CENTER43
+    FULLSCR_SCALE_CENTER43,
+    FULLSCR_SCALE_INT43_VERT
 };
 
 enum {
@@ -61,7 +62,7 @@ enum {
     VIDEO_AGP
 };
 
-typedef enum video_font_format_e 
+typedef enum video_font_format_e
 {
     FONT_FORMAT_MDA = 0,
     FONT_FORMAT_PC200 = 1,
@@ -143,6 +144,9 @@ typedef struct monitor_t {
     int                      mon_device_aspect_y;
     double                   mon_res_x;
     double                   mon_res_y;
+    /* Size of the picture on the host screen, set by the renderer; scales the mouse movement. */
+    double                   mon_picture_x;
+    double                   mon_picture_y;
     int                      mon_bpp;
     bitmap_t                *target_buffer;
     int                      mon_video_timing_read_b;
@@ -329,6 +333,8 @@ extern void    video_pre_reset(int card);
 extern void    video_reset(int card);
 extern void    video_post_reset(void);
 extern void    video_voodoo_init(void);
+extern void    video_set_override_handler(void *priv, void (*set_override)(void *priv, int val));
+extern int     video_set_override(int val);
 extern uint8_t video_force_resize_get_monitor(int monitor_index);
 extern void    video_force_resize_set_monitor(uint8_t res, int monitor_index);
 extern void    video_update_timing(void);
@@ -386,8 +392,20 @@ extern const device_t mach64ct_device;
 extern const device_t mach64ct_onboard_device;
 extern const device_t mach64vt_device;
 extern const device_t mach64vt2_device;
+extern const device_t mach64gt_device;
+extern const device_t mach64gt_onboard_device;
+extern const device_t mach64rage2_device;
+extern const device_t mach64rage2_onboard_device;
 extern const device_t mach64gtb_device;
 extern const device_t mach64gtb_onboard_device;
+extern const device_t mach64gtc_device;
+extern const device_t mach64gtc_agp_device;
+extern const device_t mach64ragepro_device;
+extern const device_t mach64ragepro_pci_device;
+extern const device_t mach64ragexl_pci_device;
+extern const device_t mach64ragelt_agp_device;
+extern const device_t mach64ragepro_onboard_device;
+extern const device_t mach64ragepro_gd_onboard_device;
 extern const device_t mach64vt3_onboard_device;
 extern const device_t ati_rage128_pro_device;
 extern const device_t ati_xpert128_pci_device;
@@ -404,9 +422,7 @@ extern const device_t ati28800_wonder1024d_xl_plus_device;
 extern const device_t ati28800k_device;
 extern const device_t ati28800k_spc4620p_device;
 extern const device_t ati28800k_spc6033p_device;
-#    ifdef USE_XL24
 extern const device_t ati28800_wonderxl24_device;
-#    endif /* USE_XL24 */
 
 /* Bochs */
 extern const device_t bochs_svga_device;
@@ -649,9 +665,6 @@ extern const device_t ps1vga_mca_device;
 
 /* 3DFX Voodoo Graphics */
 extern const device_t voodoo_device;
-
-/* PowerVR PCX1/PCX2 */
-extern const device_t powervr_pcx_device;
 extern const device_t voodoo_banshee_pci_device;
 extern const device_t voodoo_banshee_agp_device;
 extern const device_t voodoo_3_1000_device;
@@ -664,6 +677,9 @@ extern const device_t voodoo_3_3000_agp_device;
 extern const device_t voodoo_3_3500_agp_device;
 extern const device_t velocity_100_agp_device;
 extern const device_t velocity_200_agp_device;
+
+/* PowerVR PCX1/PCX2 */
+extern const device_t powervr_pcx_device;
 
 /* Wyse 700 */
 extern const device_t wy700_device;
@@ -679,6 +695,10 @@ extern const device_t tandy_1000sl_video_device;
 /* Hitachi HD44780 character LCD */
 extern const device_t hd44780_device;
 extern const device_t hd44780_cobalt3k_device;
+/* The board's own LCD bus, for an HD44780 whose port is set to it: 'e' has a
+   bit for each E line a cycle drives, bit 0 for E0. */
+extern uint8_t hd44780_bus_read(uint8_t e, int rs);
+extern void    hd44780_bus_write(uint8_t e, int rs, uint8_t val);
 enum {
     HD44780_COLOR_GREEN = 0,
     HD44780_COLOR_BLUE,

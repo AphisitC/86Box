@@ -80,11 +80,15 @@ enum {
 #define CPUID_3DNOWE (1UL << 30UL) /* Extended 3DNow! instructions */
 #define CPUID_3DNOW  (1UL << 31UL) /* 3DNow! instructions */
 
-/* APIC CPUID visibility is gated by both the CPU model and board policy. */
+/* APIC CPUID visibility is gated by both the CPU model and board policy, and
+   by IA32_APIC_BASE[11]: with the local APIC globally disabled the processor
+   is one without an on-chip APIC, and the CPUID flag reads 0 (Intel SDM vol.
+   3A, 10.4.3). Windows XP's PIC HALs clear that bit on a P6, and its
+   processr.sys takes the CPUID flag with the bit clear as a failure. */
 static uint32_t
 cpu_cpuid_apic_probe_flags(uint32_t edx)
 {
-    if (cpu_apic_feature_enabled())
+    if (cpu_apic_feature_enabled() && cpu_lapic_base_enabled_index(cpu_lapic_index_source()))
         edx |= CPUID_APIC;
 
     return edx;
@@ -187,6 +191,7 @@ int cpu_prefetch_cycles;
 int cpu_prefetch_width;
 int cpu_mem_prefetch_cycles;
 int cpu_rom_prefetch_cycles;
+int cpu_mca_bus;
 int cpu_waitstates;
 int io_waitstates; /* Extra cycles added to IN/OUT instruction timing (x86_ops_io.h) -
                        cpu_waitstates only ever throttles memory bus cycles; this covers
@@ -207,7 +212,6 @@ int reg_op_waitstates; /* Extra cycles added to pure register/branch instruction
                            io_waitstates. */
 int cpu_cache_int_enabled;
 int cpu_cache_ext_enabled;
-int cpu_flush_pending;
 int cpu_old_paging;
 int cpu_isa_speed;
 int cpu_pci_speed;
@@ -416,15 +420,86 @@ cpu_init_keeps_state(void)
     return cpu_is_p5() || (cpu_isintel && is_p6);
 }
 
+/* Whether a soft reset (the keyboard controller's reset pulse, port 92h, a
+   shutdown) leaves the FPU as it was, as the books give it:
+   - a 287 or 387 beside the CPU: on the IBM PC AT the reset pulse and a
+     shutdown reach only the CPU's RESET pin, the coprocessor is reset by
+     the system reset and an OUT to port F1h (IBM PC AT Technical
+     Reference, Mar 1986, pp. 1-53
+     and 2-4, and the planar schematic, sheets 1, 3 and 22);
+   - the Intel486 family: with no self-test (BIST) at RESET "the floating
+     point registers are unchanged" (Intel486 DX data sheet, Oct 1992,
+     section 6.5 and Table 6.2; Intel486 family data book, Jan 1995,
+     Table 9-10), an Intel487 SX included;
+   - the Am486DX family: the same words and table (Am486DX/DX2 Hardware
+     Reference Manual, 1993, pp. 6-16 and 6-17, Table 6-2); the Enhanced
+     Am486 and the Am5x86 keep the floating-point registers on SRESET too
+     (Enhanced Am486 data sheet, Mar 1996, section 6);
+   - the K5, K6 and K6-2: INIT preserves the floating-point state (AMD-K5
+     TRM 18524C, INIT; AMD-K6 data sheet 20695E, Table 28 note 3; AMD-K6-2
+     data sheet 21850, Table 32 note 3);
+   - the P54C, P55C and the P6 family: INIT (cpu_init_keeps_state);
+   - the Pentium OverDrive (P24T): a board built for it ties its INIT to
+     the SRESET pin (Intel OverDrive Processors 290436-006, Table B-4), and
+     INIT leaves the floating point registers; a RESET without self-test
+     does not alter them either (Pentium OverDrive data sheet 290544-001,
+     8.2 and Table 8-2);
+   - the Cyrix 6x86, 6x86L, 6x86MX and MII: the socket's INIT pin is their
+     WM_RST, and "WM_RST does not change the state of the configuration
+     registers, the on-chip cache, the write buffers and the FPU registers"
+     (6x86 data book, pp. 3-6 and 3-9; 6x86MX data book, pp. 3-6 and 3-9;
+     MII data book, Feb 1999, pp. 3-6 and 3-9); for the 6x86L, Application
+     Note 102, May 1997, pin AA33 and 3.3: "the floating point registers
+     remain unchanged";
+   - the VIA Cyrix III (Samuel): INIT# "resets integer registers and does
+     not affect internal cache or floating point registers" (VIA Cyrix III
+     Processor Datasheet, Nov 2000, v1.2, pin descriptions).
+   The others keep the reset the soft FPU has always given them: the CPUs
+   for which no book at hand gives the FPU state after a soft reset (Cyrix
+   486 and 5x86, the IDT WinChip, IBM's 486s, the ST STPC, the RapidCAD,
+   the K6-2+ and K6-III). */
+int
+cpu_soft_reset_keeps_fpu(void)
+{
+    if (cpu_init_keeps_state() || (fpu_type == FPU_487SX))
+        return 1;
+    if (fpu_type != FPU_INTERNAL)
+        return 1;
+    if (cpu_s == NULL)
+        return 0;
+
+    switch (cpu_s->cpu_type) {
+        case CPU_i486DX:
+        case CPU_i486DX_SLENH:
+        case CPU_Am486DX:
+        case CPU_Am486DXL:
+        case CPU_ENH_Am486DX:
+        case CPU_P24T:
+        case CPU_K5:
+        case CPU_5K86:
+        case CPU_K6:
+        case CPU_K6_2:
+        case CPU_K6_2C:
+        case CPU_Cx6x86:
+        case CPU_Cx6x86L:
+        case CPU_Cx6x86MX:
+        case CPU_CYRIX3S:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* The reset signature in EDX, for a soft reset's caller. A 386 or later
+   gets it from reset_common() once the reset is done, which for a deferred
+   or held one is later than its caller; the books of the 8086 and the 286
+   give no DX after RESET (80286 and 80287 PRM, 1987, Table 5-3), and theirs
+   is still written here. */
 void
 cpu_set_edx(void)
 {
-    EDX = cpu_s->edx_reset;
-    /* Its callers are soft resets, the INIT pin: a processor that has one
-       (the P54C and P55C) resets "without altering the FPU state"
-       (Pentium Vol. 3, 16.2). */
-    if (fpu_softfloat && !cpu_init_keeps_state())
-        SF_FPU_reset();
+    if (!is386)
+        EDX = cpu_s->edx_reset;
 }
 
 cpu_family_t *
@@ -616,6 +691,7 @@ cpu_set(void)
     cpu_s         = (CPU *) &cpu_f->cpus[cpu_effective];
 
     soft_reset_pci    = 0;
+    soft_reset_387    = 0;
     cpu_init          = 0;
 
     cpu_alt_reset     = 0;
@@ -702,8 +778,25 @@ cpu_set(void)
 
     if (cpu_s->rspeed <= 8000000)
         cpu_rom_prefetch_cycles = cpu_mem_prefetch_cycles;
+    else if (is586)
+        cpu_rom_prefetch_cycles = (int) (6.0 * ((double) cpu_s->rspeed / (double) cpu_isa_speed));
     else
-        cpu_rom_prefetch_cycles = cpu_s->rspeed / 1000000;
+        cpu_rom_prefetch_cycles = (int) (8.0 * ((double) cpu_s->rspeed / (double) cpu_isa_speed));
+
+    /* MCA PS/2 boards copy the BIOS ROM to RAM after POST and disable the
+       ROM (PS/2 Model 70 Technical Reference, May 1988, p. 39 of the PDF),
+       so prefetch_run() does not stretch their ROM fetches. */
+    cpu_mca_bus = !!machine_has_bus(machine, MACHINE_BUS_MCA | MACHINE_BUS_MCA32);
+
+    io_delay_multi = 0;
+    if ((machines[machine].init == machine_xt_ibm5550_init) ||
+        (machines[machine].init == machine_xt_ibm5535_init))
+        io_delay = 8;
+    else if (is286) {
+        io_delay = cpu_rom_prefetch_cycles;
+        io_delay_multi = 1;
+    } else
+        io_delay = (int) round(((double) cpu_s->rspeed) / 3000000.0);
 
     cpu_set_isa_pci_div(0);
     cpu_set_pci_speed(0);
@@ -1303,6 +1396,10 @@ cpu_set(void)
         case CPU_i486DX_SLENH:
             cpu_features = CPU_FEATURE_CR4 | CPU_FEATURE_VME;
             cpu_CR4_mask = CR4_VME | CR4_PVI | CR4_VME;
+            /* The Intel486 data books give CR4 only VME and PVI and no #GP for
+               its other bits, so a write to them is dropped: Windows XP sets
+               DE on any processor with VME. */
+            cpu_CR4_ignore = ~cpu_CR4_mask & 0xffffffff;
             fallthrough;
         case CPU_RAPIDCAD:
         case CPU_i486SX:
@@ -2076,6 +2173,23 @@ cpu_set_isa_speed(int speed)
     else
         cpu_isa_speed = cpu_busspeed;
 
+    if (cpu_s->rspeed <= 8000000)
+        cpu_rom_prefetch_cycles = cpu_mem_prefetch_cycles;
+    else if (is586)
+        cpu_rom_prefetch_cycles = (int) (6.0 * ((double) cpu_s->rspeed / (double) cpu_isa_speed));
+    else
+        cpu_rom_prefetch_cycles = (int) (8.0 * ((double) cpu_s->rspeed / (double) cpu_isa_speed));
+
+    io_delay_multi = 0;
+    if ((machines[machine].init == machine_xt_ibm5550_init) ||
+        (machines[machine].init == machine_xt_ibm5535_init))
+        io_delay = 8;
+    else if (is286) {
+        io_delay = cpu_rom_prefetch_cycles;
+        io_delay_multi = 1;
+    } else
+        io_delay = (int) round(((double) cpu_s->rspeed) / 3000000.0);
+
     pc_speed_changed();
 
     cpu_log("cpu_set_isa_speed(%d) = %d\n", speed, cpu_isa_speed);
@@ -2197,6 +2311,8 @@ cpu_CPUID(void)
                 EAX = CPUID;
                 EBX = ECX = 0;
                 EDX       = CPUID_VME;
+                if (fpu_type == FPU_487SX)
+                    EDX |= CPUID_FPU;
             } else
                 EAX = EBX = ECX = EDX = 0;
             break;
@@ -2969,6 +3085,22 @@ cpu_ven_reset(void)
     }
 }
 
+/* A read of the TSC through an MSR counts the compiled block's cycles so
+   far, as RDTSC does: they reach the counter only through update_tsc().
+   A due timer run there can reset the CPU; the registers then hold the
+   reset state and the read returns nothing (nonzero). */
+static int
+tsc_msr_sync(void)
+{
+#ifdef USE_DYNAREC
+    if (cpu_use_dynarec) {
+        update_tsc();
+        return x86_was_reset;
+    }
+#endif
+    return 0;
+}
+
 void
 cpu_RDMSR(void)
 {
@@ -3025,6 +3157,8 @@ cpu_RDMSR(void)
                     break;
                 /* Time Stamp Counter */
                 case 0x10:
+                    if (tsc_msr_sync())
+                        break;
                     EAX = tsc & 0xffffffff;
                     EDX = tsc >> 32;
                     break;
@@ -3079,6 +3213,8 @@ cpu_RDMSR(void)
                     break;
                 /* Time Stamp Counter */
                 case 0x10:
+                    if (tsc_msr_sync())
+                        break;
                     EAX = tsc & 0xffffffff;
                     EDX = tsc >> 32;
                     break;
@@ -3111,6 +3247,8 @@ cpu_RDMSR(void)
                     break;
                 /* PERFCTR0 - Performance Counter Register 0 - aliased to TSC */
                 case 0xc1:
+                    if (tsc_msr_sync())
+                        break;
                     EAX = tsc & 0xffffffff;
                     EDX = (tsc >> 32) & 0xff;
                     break;
@@ -3213,6 +3351,8 @@ cpu_RDMSR(void)
                     break;
                 /* Time Stamp Counter */
                 case 0x00000010:
+                    if (tsc_msr_sync())
+                        break;
                     EAX = tsc & 0xffffffff;
                     EDX = tsc >> 32;
                     break;
@@ -3398,6 +3538,8 @@ amd_k_invalid_rdmsr:
                 /* Time Stamp Counter */
                 case 0x00000010:
                 case 0x80000010:
+                    if (tsc_msr_sync())
+                        break;
                     EAX = tsc & 0xffffffff;
                     EDX = tsc >> 32;
                     break;
@@ -3510,6 +3652,8 @@ pentium_invalid_rdmsr:
                     break;
                 /* Time Stamp Counter */
                 case 0x10:
+                    if (tsc_msr_sync())
+                        break;
                     EAX = tsc & 0xffffffff;
                     EDX = tsc >> 32;
                     break;
@@ -3545,6 +3689,8 @@ pentium_invalid_rdmsr:
                     break;
                 /* Time Stamp Counter */
                 case 0x10:
+                    if (tsc_msr_sync())
+                        break;
                     EAX = tsc & 0xffffffff;
                     EDX = tsc >> 32;
                     break;
