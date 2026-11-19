@@ -13,12 +13,16 @@
  *
  *          This file connects the chip model to 86Box: PCI identity and
  *          BARs, bus-master DMA, the interrupt line, the sample timer,
- *          the STAC9708 AC'97 codec and the sound output.
+ *          the STAC9708 AC'97 codec and the sound output, and the
+ *          chip's legacy MPU-401 UART and game port (on 86Box's own
+ *          MPU-401 and game port, so MIDI goes to whatever MIDI device
+ *          is configured, standing in for a board on the card's Wave
+ *          Blaster header).
  *
  *          PCI configuration values were read from an SQ2500 (AU8830,
  *          revision 0xfa).
  *
- * Authors: Z2k Retro, Aphisit Chanmana (อภิสิทธิ์ จันทร์มานะ) and contributors.
+ * Authors: Z2k Retro and contributors.
  *
  *          Copyright 2026 Z2k Retro.
  */
@@ -31,6 +35,7 @@
 #include <math.h>
 #define HAVE_STDARG_H
 #include <86box/86box.h>
+#include "cpu.h"
 #include <86box/device.h>
 #include <86box/dma.h>
 #include <86box/io.h>
@@ -39,9 +44,12 @@
 #include <86box/timer.h>
 #include <86box/sound.h>
 #include <86box/snd_ac97.h>
+#include <86box/snd_mpu401.h>
+#include <86box/gameport.h>
 #include <86box/plat_unused.h>
 #include <86box/plat.h>
 #include <86box/path.h>
+#include <86box/snd_opl.h>
 
 #include "snd_vortex2_core.h"
 
@@ -63,6 +71,22 @@ typedef struct vortex2_t {
     uint32_t index;
 
     mem_mapping_t mmio;
+
+    mpu_t   *mpu;
+    void    *gameport;
+    uint16_t mpu_addr, game_addr;
+    uint8_t  game_fired; /* unplugged port: one-shots triggered and never timing out */
+
+    /* FM front end (ports 388h-38bh): the chip latches the index, keeps a
+       packed copy of the OPL3 registers at 0x29900 and runs the two OPL
+       timers; the sound itself is made by the driver's software from that
+       copy (sbprobe fm and fmmap, 2026-11-18). */
+    int        fm_on;
+    int        fm_vortex; /* 1: Aureal's own FM (the driver's software synth); 0: 86Box's OPL3 */
+    fm_drv_t   opl;
+    uint8_t    fm_index, fm_bank, fm_new;
+    uint8_t    fm_t[2], fm_ctl, fm_flags;
+    pc_timer_t fm_timer[2];
 
     pc_timer_t block_timer;
     pc_timer_t irq_timer;
@@ -188,21 +212,369 @@ trace_time(const vortex2_t *dev)
     return (double) host_clock((void *) dev) / (256.0 * 48000.0);
 }
 
+/* ------------------------------------------------------------------ */
+/* Legacy MIDI and game port                                           */
+/*                                                                     */
+/* Read on a real SQ2500 from the host (legacyprobe, 2026-11-17): the  */
+/* MPU-401 is a UART at 0x28800 (data) and 0x28804 (command/status),   */
+/* acknowledging reset (0xff) and UART mode (0x3f) with 0xfe, with a   */
+/* 16-byte transmit FIFO and 31,670 baud from the 49.152 MHz crystal / */
+/* (16 x the divider in CTRL2 bits 15-8, 0x61 from the driver). The    */
+/* game port's byte is at 0x28808 (buttons 7-4, one-shots 3-0), and in */
+/* ADC mode (CTRL2 0x2880c bit 6) four 13-bit axis words sit at        */
+/* 0x28810. The chip control word 0x2a00c enables the legacy I/O       */
+/* decodes: bit 0 the MPU-401 at the address in bits 6-5, bit 3 the    */
+/* game port at the address in bits 11-9. The Windows driver sets      */
+/* fields 3 and 1 and talks to the MPU-401 only through the legacy     */
+/* port. Field 3 is 0x330 (ALSA); the rest of each encoding was not    */
+/* readable on the probe machine, so fields map to 0x300 + 0x10 x n    */
+/* and 0x200 + n (field 1 = 0x201, the usual game port).               */
+/* ------------------------------------------------------------------ */
+
+#define V2_MIDI_DATA   0x28800
+#define V2_MIDI_CMD    0x28804
+#define V2_GAME_LEGACY 0x28808
+#define V2_CTRL2       0x2880c
+#define V2_GAME_AXIS   0x28810
+#define V2_CHIP_CTRL   0x2a00c
+#define V2_IRQ_MIDI    0x2000
+#define V2_FM_LATCH 0x29854 /* low byte: last index; bit 8: OPL3 mode; 9-11 kept */
+#define V2_FM_FILE  0x29900 /* 256 bytes: the packed register file */
+#define V2_FM_TRASH 0xd4    /* where registers the chip does not keep land */
+#define V2_IRQ_FMTIMER 0x40 /* set in IRQ_SOURCE when an unmasked timer ran out */
+/* Control-word bit 2 enables the FM decode (sbprobe fmbit: 388h answers
+   with bit 2 alone and stops with only bit 2 taken away; bits 1, 4, 19 and
+   24 do nothing to it). Bit 1, set with it by AU30DOS and the driver, is
+   probably the Sound Blaster ports, which this host does not forward. */
+#define V2_CTRL_FM_EN 0x4
+
+static uint8_t fm_read(uint16_t port, void *priv);
+static void    fm_write(uint16_t port, uint8_t val, void *priv);
+
+static void
+legacy_remap(vortex2_t *dev)
+{
+    uint32_t ctl  = v2_read(dev->chip, V2_CHIP_CTRL);
+    uint16_t midi = (ctl & 1) ? (0x300 + 0x10 * ((ctl >> 5) & 3)) : 0;
+    uint16_t game = (ctl & 8) ? (0x200 + ((ctl >> 9) & 7)) : 0;
+
+    if (dev->mpu && midi != dev->mpu_addr) {
+        mpu401_change_addr(dev->mpu, midi);
+        dev->mpu_addr = midi;
+        vortex2_log("Vortex2: MPU-401 at %03x\n", midi);
+    }
+    if (dev->gameport && game != dev->game_addr) {
+        gameport_remap(dev->gameport, game);
+        dev->game_addr = game;
+        vortex2_log("Vortex2: game port at %03x\n", game);
+    }
+    int fm = !!(ctl & V2_CTRL_FM_EN);
+    if (fm != dev->fm_on) {
+        if (dev->fm_vortex) {
+            if (fm)
+                io_sethandler(0x388, 4, fm_read, NULL, NULL, fm_write, NULL, NULL, dev);
+            else
+                io_removehandler(0x388, 4, fm_read, NULL, NULL, fm_write, NULL, NULL, dev);
+        } else {
+            if (fm)
+                io_sethandler(0x388, 4, dev->opl.read, NULL, NULL, dev->opl.write, NULL, NULL, dev->opl.priv);
+            else
+                io_removehandler(0x388, 4, dev->opl.read, NULL, NULL, dev->opl.write, NULL, NULL, dev->opl.priv);
+        }
+        dev->fm_on = fm;
+        vortex2_log("Vortex2: FM ports %s\n", fm ? "on" : "off");
+    }
+}
+
+/* ---------------------------------------------------------------- FM */
+
+/* Where an OPL3 register lands in the packed file (fmmap): operator groups
+   of 18, channel groups of 9, bank 1 0x78 bytes on. */
+static int
+fm_offset(int bank, uint8_t reg)
+{
+    static const uint8_t op_base[8] = { 0, 0x02, 0x14, 0x26, 0x38, 0, 0, 0x66 };
+    int                  b          = bank ? 0x78 : 0;
+    int                  grp        = reg >> 5;
+
+    if (reg == 0x01)
+        return b;
+    if (!bank && reg == 0x08)
+        return 0x01;
+    if (bank && reg == 0x04)
+        return 0x79;
+    if (!bank && reg == 0xbd)
+        return 0x5c;
+    if (op_base[grp]) {
+        int lo = reg & 0x1f, slot;
+        if (lo < 6)
+            slot = lo;
+        else if (lo >= 8 && lo < 0x0e)
+            slot = lo - 2;
+        else if (lo >= 0x10 && lo < 0x16)
+            slot = lo - 4;
+        else
+            return V2_FM_TRASH;
+        return b + op_base[grp] + slot;
+    }
+    if (reg >= 0xa0 && reg <= 0xa8)
+        return b + 0x4a + (reg - 0xa0);
+    if (reg >= 0xb0 && reg <= 0xb8)
+        return b + 0x53 + (reg - 0xb0);
+    if (reg >= 0xc0 && reg <= 0xc8)
+        return b + 0x5d + (reg - 0xc0);
+    return V2_FM_TRASH;
+}
+
+static void
+fm_file_or(vortex2_t *dev, int off, uint8_t v, int replace)
+{
+    uint32_t a = V2_FM_FILE + (off & ~3), sh = (off & 3) * 8;
+    uint32_t w = v2_read(dev->chip, a);
+    w          = replace ? ((w & ~(0xffu << sh)) | ((uint32_t) v << sh)) : (w | ((uint32_t) v << sh));
+    v2_write(dev->chip, a, w);
+}
+
+static void
+fm_latch_update(vortex2_t *dev)
+{
+    uint32_t l = v2_read(dev->chip, V2_FM_LATCH);
+    v2_write(dev->chip, V2_FM_LATCH, (l & 0xe00) | (dev->fm_new ? 0x100 : 0) | dev->fm_index);
+}
+
+static void
+fm_timer_start(vortex2_t *dev, int t)
+{
+    /* timer 1 counts 80 us steps, timer 2 320 us, from the preset to 256 */
+    double us = (256 - dev->fm_t[t]) * (t ? 320.0 : 80.0);
+    timer_on_auto(&dev->fm_timer[t], us);
+}
+
+static void
+fm_timer_cb(vortex2_t *dev, int t)
+{
+    if (!(dev->fm_ctl & (1 << t)))
+        return;
+    if (!(dev->fm_ctl & (t ? 0x20 : 0x40))) {
+        dev->fm_flags |= t ? 0x20 : 0x40;
+        v2_ext_irq(dev->chip, V2_IRQ_FMTIMER, 1);
+    }
+    fm_timer_start(dev, t); /* an OPL timer reloads and keeps running */
+}
+static void fm_timer1(void *p) { fm_timer_cb((vortex2_t *) p, 0); }
+static void fm_timer2(void *p) { fm_timer_cb((vortex2_t *) p, 1); }
+
+static uint8_t
+fm_read(uint16_t port, void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    /* A legacy port access takes bus time, as on any AdLib-compatible
+       part. Without it the reads cost nothing here, and detection loops
+       that wait for timer 1's 80 us by reading the status port (Apogee's:
+       about 135 reads) finished before it ran out: "Could not detect FM
+       chip" in Duke Nukem 3D's setup. */
+    cycles -= ISA_CYCLES(8);
+    if (port != 0x388)
+        return 0xff; /* as read on the card: only 388h gives the status */
+    return dev->fm_flags ? (0x80 | dev->fm_flags) : 0x00;
+}
+
+static void
+fm_write(uint16_t port, uint8_t val, void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    cycles -= ISA_CYCLES(8);
+    if (!(port & 1)) {
+        dev->fm_index = val;
+        dev->fm_bank  = (port & 2) >> 1;
+        fm_latch_update(dev);
+        return;
+    }
+    if (!dev->fm_bank && dev->fm_index >= 0x02 && dev->fm_index <= 0x04) {
+        if (dev->fm_index < 0x04) {
+            dev->fm_t[dev->fm_index - 2] = val;
+            return;
+        }
+        if (val & 0x80) { /* reset the flags; the rest of the byte is ignored */
+            dev->fm_flags = 0;
+            return;
+        }
+        dev->fm_ctl = val;
+        for (int t = 0; t < 2; t++) {
+            if (val & (1 << t))
+                fm_timer_start(dev, t);
+            else
+                timer_disable(&dev->fm_timer[t]);
+        }
+        return;
+    }
+    if (dev->fm_bank && dev->fm_index == 0x05) {
+        dev->fm_new = val & 1;
+        fm_latch_update(dev);
+    }
+    /* Bank 1 is kept only in OPL3 mode (sbprobe fmflag: with register
+       0x105 clear, a bank-1 write left the file as it was). */
+    if (dev->fm_bank && !dev->fm_new && dev->fm_index != 0x05)
+        return;
+    int off = fm_offset(dev->fm_bank, dev->fm_index);
+    if ((dev->fm_index & 0xf0) == 0xb0 && dev->fm_index <= 0xb8 && off != V2_FM_TRASH) {
+        /* A key-off write (bit 5 clear) is stored with bits 7-6 set, which
+           clear when the word is read; a key-on write is stored as written
+           (sbprobe fmflag, 2026-11-18). The renderer polls the file and so
+           sees each key-off once, even one written over a key-off. */
+        fm_file_or(dev, off, (val & 0x20) ? val : (val | 0xc0), 1);
+    } else
+        fm_file_or(dev, off, val, 1);
+    if (!dev->fm_bank && dev->fm_index == 0xbd && !(val & 0x20))
+        for (int k = 0x59; k <= 0x5b; k++) /* rhythm off: key-off on channels 6-8 (fmmap: 0xbd = 0x5a) */
+            fm_file_or(dev, k, 0xc0, 0);
+}
+
+static void
+legacy_mpu_irq(void *priv, int set)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    v2_ext_irq(dev->chip, V2_IRQ_MIDI, set);
+}
+
+static int
+legacy_mpu_irq_pending(void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    return !!(v2_read(dev->chip, 0x2a000) & V2_IRQ_MIDI);
+}
+
+/* Registers 0x28800-0x2881f; returns 1 if handled. */
+static int
+legacy_read(vortex2_t *dev, uint32_t a, uint32_t *v)
+{
+    switch (a) {
+        case V2_MIDI_DATA:
+            *v = dev->mpu ? mpu401_read(0, dev->mpu) : 0xff;
+            return 1;
+        case V2_MIDI_CMD:
+            *v = dev->mpu ? mpu401_read(1, dev->mpu) : 0xff;
+            return 1;
+        case V2_GAME_LEGACY:
+            /* With a joystick selected and the legacy decode on, through the
+               game port. Otherwise the port as the real card reads with
+               nothing plugged in (legacyprobe game): 0xf0 at rest (buttons
+               up, one-shots idle), then 0xff from the first trigger write on,
+               since with no stick the one-shots never time out. Returning
+               0xf0 for good, as before, looked like a stick with four axes
+               at zero, which Windows took for a joystick. With a joystick
+               selected but the decode off, the stick is not reached here. */
+            if (dev->game_addr && joystick_type[0] != JS_TYPE_NONE)
+                *v = inb(dev->game_addr);
+            else
+                *v = dev->game_fired ? 0xff : 0xf0;
+            return 1;
+        default:
+            if (a >= V2_GAME_AXIS && a < V2_GAME_AXIS + 16) {
+                /* ADC mode: 13-bit axis values; 0x1fff (read as 0xffff on
+                   the card) when nothing is plugged in */
+                int i = (a - V2_GAME_AXIS) >> 2;
+                if (joystick_type[0] != JS_TYPE_NONE && i < joystick_get_axis_count(joystick_type[0]))
+                    *v = ((uint32_t) (joystick_state[0][0].axis[i] + 32768) >> 3) & 0x1fff;
+                else
+                    *v = 0xffff;
+                return 1;
+            }
+            return 0;
+    }
+}
+
+static int
+legacy_write(vortex2_t *dev, uint32_t a, uint32_t v)
+{
+    switch (a) {
+        case V2_MIDI_DATA:
+            if (dev->mpu)
+                mpu401_write(0, v & 0xff, dev->mpu);
+            return 1;
+        case V2_MIDI_CMD:
+            if (dev->mpu)
+                mpu401_write(1, v & 0xff, dev->mpu);
+            return 1;
+        case V2_GAME_LEGACY:
+            if (dev->game_addr && joystick_type[0] != JS_TYPE_NONE)
+                outb(dev->game_addr, v & 0xff);
+            else
+                dev->game_fired = 1;
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 static uint32_t
 tr_read(vortex2_t *dev, uint32_t a)
 {
-    uint32_t v = v2_read(dev->chip, a);
+    uint32_t v;
+    if (a >= V2_MIDI_DATA && a < V2_MIDI_DATA + 0x20 && legacy_read(dev, a, &v)) {
+        if (dev->tracef)
+            fprintf(dev->tracef, "%11.6f  R 0x%05x mmio 0x%08x\n", trace_time(dev), a, v);
+        return v;
+    }
+    v = v2_read(dev->chip, a);
     if (dev->tracef)
         fprintf(dev->tracef, "%11.6f  R 0x%05x mmio 0x%08x\n", trace_time(dev), a, v);
+    if (a >= V2_FM_FILE + 0x50 && a < V2_FM_FILE + 0xd4) {
+        /* Key-on bytes (0xb0-0xb8 of each bank) carry bits 7-6 after a
+           key-off write; reading the word clears them (sbprobe fmflag: the
+           first read gave 0xc5, the next ones 0x05, and unread they stayed
+           set for 20 ms). */
+        uint32_t m = 0;
+        for (int b = 0; b < 4; b++) {
+            int off = (a - V2_FM_FILE) + b;
+            if ((off >= 0x53 && off <= 0x5b) || (off >= 0xcb && off <= 0xd3))
+                m |= 0xc0u << (8 * b);
+        }
+        if (m && (v & m))
+            v2_write(dev->chip, a, v & ~m);
+    }
     return v;
 }
+
+static void vortex2_chip_reset(vortex2_t *dev);
 
 static void
 tr_write(vortex2_t *dev, uint32_t a, uint32_t v)
 {
     if (dev->tracef)
         fprintf(dev->tracef, "%11.6f  W 0x%05x mmio 0x%08x\n", trace_time(dev), a, v);
+    if (a >= V2_MIDI_DATA && a < V2_MIDI_DATA + 0x20 && legacy_write(dev, a, v))
+        return;
+    if (a == V2_FM_LATCH) {
+        /* bits 9-11 hold what is written; the index and the OPL3 bit stay */
+        uint32_t l = v2_read(dev->chip, V2_FM_LATCH);
+        v2_write(dev->chip, V2_FM_LATCH, (l & 0x1ff) | (v & 0xe00));
+        return;
+    }
+    if (a == 0x29808) {
+        /* reads back 0xff; its byte goes to the latch's low byte (sbprobe) */
+        dev->fm_index = v & 0xff;
+        fm_latch_update(dev);
+        return;
+    }
+    if (a == V2_CHIP_CTRL && v == 0xffffffff) {
+        /* All ones resets the chip (Plausible): AU30DOS writes it first thing and then,
+           after a pause, the reset word with bit 21 cleared (0x103260); the
+           driver writes it on shutting down, and on a start-up without
+           AU30DOS writes it, reads the word back and clears bit 21. Kept
+           as written, the driver read all ones back and turned every legacy
+           decode on, the FM ports included, which then made AU30DOS see
+           388h as taken after "Restart in MS-DOS mode" (error #7). */
+        vortex2_chip_reset(dev);
+        return;
+    }
     v2_write(dev->chip, a, v);
+    if (a == V2_CHIP_CTRL)
+        legacy_remap(dev);
 }
 
 static uint16_t
@@ -432,6 +804,21 @@ vortex2_get_buffer(int32_t *buffer, uint16_t len, void *priv)
     for (uint16_t c = 0; c < len * 2; c++)
         buffer[c] += dev->buffer[c];
     dev->pos = 0;
+}
+
+/* With "Vortex FM synthesis" off (the default), the FM ports go to 86Box's
+   OPL3 instead of the chip's front end, and its output is mixed in here.
+   The chip's register copy then stays empty, so Aureal's software synth,
+   which renders from it, stays silent. */
+static void
+vortex2_get_music_buffer(int32_t *buffer, uint16_t len, void *priv)
+{
+    vortex2_t     *dev = (vortex2_t *) priv;
+    const int32_t *opl_buf = dev->opl.update(dev->opl.priv);
+
+    for (uint16_t c = 0; c < len * 2; c++)
+        buffer[c] += (int32_t) (opl_buf[c] * 0.7171630859375);
+    dev->opl.reset_buffer(dev->opl.priv);
 }
 
 static void
@@ -748,6 +1135,20 @@ vortex2_speed_changed(void *priv)
 }
 
 static void
+vortex2_chip_reset(vortex2_t *dev)
+{
+    /* Only the control word is put back to its reset value: what else the
+       chip clears is not known (the driver reads 0x2a804 straight after and
+       rewrites everything it uses), and the legacy decodes follow the word. */
+    v2_write(dev->chip, V2_CHIP_CTRL, 0x00303260);
+    dev->game_fired = 0;
+    timer_disable(&dev->fm_timer[0]);
+    timer_disable(&dev->fm_timer[1]);
+    dev->fm_ctl = dev->fm_flags = dev->fm_new = dev->fm_index = dev->fm_bank = 0;
+    legacy_remap(dev);
+}
+
+static void
 vortex2_reset(void *priv)
 {
     vortex2_t *dev = (vortex2_t *) priv;
@@ -755,6 +1156,11 @@ vortex2_reset(void *priv)
     v2_reset(dev->chip);
     if (dev->codec)
         ac97_codec_reset(dev->codec);
+    dev->game_fired = 0;
+    timer_disable(&dev->fm_timer[0]);
+    timer_disable(&dev->fm_timer[1]);
+    dev->fm_ctl = dev->fm_flags = dev->fm_new = dev->fm_index = dev->fm_bank = 0;
+    legacy_remap(dev);
 }
 
 static void *
@@ -819,6 +1225,27 @@ vortex2_init(UNUSED(const device_t *info))
 
     sound_add_handler(vortex2_get_buffer, dev);
 
+    /* Legacy MIDI and game port, mapped when the driver enables them. */
+    dev->mpu = (mpu_t *) calloc(1, sizeof(mpu_t));
+    mpu401_init(dev->mpu, 0, -1, M_UART, device_get_config_int("receive_input401"));
+    mpu401_irq_attach(dev->mpu, legacy_mpu_irq, legacy_mpu_irq_pending, dev);
+    /* The game port can be left off: Windows' legacy detection finds any
+       port answering at 0x201 and adds its own "Gameport Joystick" entry,
+       which then holds the address the Vortex's Gameport Interface asks
+       for. Off, nothing answers there and the card's legacy byte reads as
+       an empty port. */
+    dev->fm_vortex = device_get_config_int("vortex_fm");
+    if (!dev->fm_vortex) {
+        fm_driver_get(FM_YMF262, &dev->opl);
+        music_add_handler(vortex2_get_music_buffer, dev);
+    }
+    timer_add(&dev->fm_timer[0], fm_timer1, dev, 0);
+    timer_add(&dev->fm_timer[1], fm_timer2, dev, 0);
+    if (device_get_config_int("gameport")) {
+        dev->gameport = gameport_add(&gameport_device);
+        gameport_remap(dev->gameport, 0);
+    }
+
     vortex2_speed_changed(dev);
     timer_add(&dev->block_timer, vortex2_block, dev, 1);
     timer_set_delay_u64(&dev->block_timer, dev->block_latch);
@@ -832,6 +1259,7 @@ vortex2_close(void *priv)
     vortex2_t *dev = (vortex2_t *) priv;
 
     v2_destroy(dev->chip);
+    free(dev->mpu);
     if (dev->logf)
         fclose(dev->logf);
     if (dev->tracef)
@@ -871,6 +1299,39 @@ static const device_config_t vortex2_config[] = {
             { .description = "-24 dB",                           .value = -24 },
             { .description = ""                                               }
         },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "vortex_fm",
+        .description    = "Vortex FM synthesis (Aureal's software FM, as on the real card)",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "gameport",
+        .description    = "Game port",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 1,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "receive_input401",
+        .description    = "Receive MIDI input (MPU-401)",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
         .bios           = { { 0 } }
     },
     {
