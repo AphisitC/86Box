@@ -196,6 +196,12 @@ video_cards[] = {
     { .device = &millennium_ii_device,                          .flags = VIDEO_FLAG_TYPE_SEC       },
     { .device = &mystique_device,                               .flags = VIDEO_FLAG_TYPE_SEC       },
     { .device = &mystique_220_device,                           .flags = VIDEO_FLAG_TYPE_SEC       },
+    { .device = &nv3_device_pci,                                .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv3t_device_pci,                               .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv4_tnt_pci_device,                            .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv5_tnt2_pci_device,                           .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv5_tnt2_ultra_pci_device,                     .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv5_vanta_pci_device,                          .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &s3_86c928_pci_device,                          .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &s3_trio32_pci_device,                          .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &s3_trio3d2x_pci_device,                        .flags = VIDEO_FLAG_TYPE_NONE      },
@@ -233,6 +239,17 @@ video_cards[] = {
     { .device = &mach64gtc_agp_device,                          .flags = VIDEO_FLAG_TYPE_SEC       },
     { .device = &mach64ragelt_agp_device,                       .flags = VIDEO_FLAG_TYPE_SEC       },
     { .device = &millennium_ii_agp_device,                      .flags = VIDEO_FLAG_TYPE_SEC       },
+    { .device = &nv3_device_agp,                                .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv3t_device_agp,                               .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv4_tnt_agp_device,                            .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv5_tnt2_agp_device,                           .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv5_tnt2_ultra_agp_device,                     .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv5_vanta_agp_device,                          .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv10_geforce256_agp_device,                    .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv10_geforce256_ddr_agp_device,                .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv10_quadro_agp_device,                        .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv15_geforce2_gts_agp_device,                  .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &nv15_geforce2_pro_agp_device,                  .flags = VIDEO_FLAG_TYPE_NONE      },
 #ifdef USE_G100
     { .device = &productiva_g100_device,                        .flags = VIDEO_FLAG_TYPE_SEC       },
 #endif /*USE_G100 */
@@ -547,7 +564,8 @@ video_reset(int card)
         if ((gfxcard[i] == VID_NONE) || (gfxcard[i] == VID_INTERNAL) || (gfxcard[i] == VID_EXTERNAL))
             continue;
 
-        if ((card != VID_NONE) && device_is_valid(video_card_getdevice(gfxcard[i]), machine) &&
+        /* A card in a later slot is added whether or not the first slot holds one. */
+        if (device_is_valid(video_card_getdevice(gfxcard[i]), machine) &&
             (!machine_has_flags(machine, MACHINE_VIDEO_ONLY) || machine_has_flags(machine, MACHINE_VIDEO_EXT))) {
             video_monitor_init(i);
             monitor_index_global = 1;
