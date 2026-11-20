@@ -1,0 +1,731 @@
+/*
+ * 86Box    A hypervisor and IBM PC system emulator that specializes in
+ *          running old operating systems and software designed for IBM
+ *          PC systems and compatibles from 1981 through fairly recent
+ *          system designs based on the PCI bus.
+ *
+ *          This file is part of the 86Box distribution.
+ *
+ *          Tests of the RIVA TNT's Direct3D classes drawing into a
+ *          swizzled colour surface (render to texture).
+ *
+ *          The 3D code is included as C. The surface registers are set
+ *          as the 3D surfaces class (0x53) leaves them, triangles go in
+ *          through the DX5 class's (0x54) methods, and the pixels are
+ *          read back from video memory. The swizzled layout is worked
+ *          out here, not with the engine's helper.
+ *
+ * Authors: Marcos Alves, <xeon4d@gmail.com>
+ *
+ *          Copyright 2026 Marcos Alves
+ */
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../../src/video/nv/nv4/subsystems/nv4_pgraph_3d.c"
+
+#define VRAM_SIZE (1 << 20)
+#define COL_BASE  0x10000
+#define Z_BASE    0x20000
+
+#define CHECK(cond)                                                    \
+    do {                                                               \
+        if (!(cond)) {                                                 \
+            fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #cond); \
+            failures++;                                                \
+        }                                                              \
+    } while (0)
+
+static int failures;
+
+/* What the 3D code reaches outside itself: nothing here textures,
+   threads or uses the GPU lane. */
+uint64_t tsc;
+double   cpuclock = 1.0;
+uint32_t mem_size;
+uint8_t *ram;
+
+void
+pclog(const char *fmt, ...)
+{
+    (void) fmt;
+}
+
+int
+agpgart_resolve(uint32_t addr, uint32_t *ram_addr)
+{
+    (void) addr;
+    (void) ram_addr;
+    return 0;
+}
+
+uint8_t
+mem_readb_phys(uint32_t addr)
+{
+    (void) addr;
+    return 0;
+}
+
+uint16_t
+mem_readw_phys(uint32_t addr)
+{
+    (void) addr;
+    return 0;
+}
+
+uint32_t
+mem_readl_phys(uint32_t addr)
+{
+    (void) addr;
+    return 0;
+}
+
+int
+nv4_dma_translate(nv4_t *nv4, uint32_t inst, uint32_t offset, int write, uint32_t *addr, int *target)
+{
+    (void) nv4;
+    (void) inst;
+    (void) offset;
+    (void) write;
+    (void) addr;
+    (void) target;
+    return !NV4_DMA_OK;
+}
+
+int
+nv4_dma_read(nv4_t *nv4, uint32_t inst, uint32_t offset, uint8_t *buf, uint32_t len)
+{
+    (void) nv4;
+    (void) inst;
+    (void) offset;
+    (void) buf;
+    (void) len;
+    return NV4_DMA_FAULT;
+}
+
+uint32_t
+nv4_dma_page_left(nv4_t *nv4, uint32_t inst, uint32_t offset)
+{
+    (void) nv4;
+    (void) inst;
+    (void) offset;
+    return 0x1000;
+}
+
+void
+nv4_pgraph_2d_flush_run(nv4_t *nv4)
+{
+    (void) nv4;
+}
+
+void
+nv4_pgraph_set_grobj(nv4_t *nv4, int word, int shift, int bits, uint32_t val)
+{
+    (void) nv4;
+    (void) word;
+    (void) shift;
+    (void) bits;
+    (void) val;
+}
+
+uint32_t
+nv4_ramin_read32(nv4_t *nv4, uint32_t off)
+{
+    (void) nv4;
+    (void) off;
+    return 0;
+}
+
+struct nv4_gpu_s *
+nv4_gpu_init(nv4_t *nv4)
+{
+    (void) nv4;
+    return NULL;
+}
+
+int
+nv4_gpu_shade(struct nv4_gpu_s *g, nv4_t *nv4, const nv4_3d_batch_t *b)
+{
+    (void) g;
+    (void) nv4;
+    (void) b;
+    return 0;
+}
+
+void
+nv4_gpu_close(struct nv4_gpu_s *g)
+{
+    (void) g;
+}
+
+void
+nv4_gpu_wait(struct nv4_gpu_s *g, nv4_t *nv4)
+{
+    (void) g;
+    (void) nv4;
+}
+
+int
+nv4_gpu_pending_overlaps(struct nv4_gpu_s *g, uint32_t lo, uint32_t hi)
+{
+    (void) g;
+    (void) lo;
+    (void) hi;
+    return 0;
+}
+
+void
+nv4_gpu_counts(struct nv4_gpu_s *g, uint64_t *batches, uint64_t *fallbacks)
+{
+    (void) g;
+    *batches = *fallbacks = 0;
+}
+
+thread_t *
+thread_create_named(void (*thread_func)(void *param), void *param, const char *name)
+{
+    (void) thread_func;
+    (void) param;
+    (void) name;
+    return NULL;
+}
+
+int
+thread_wait(thread_t *arg)
+{
+    (void) arg;
+    return 0;
+}
+
+event_t *
+thread_create_event(void)
+{
+    return NULL;
+}
+
+void
+thread_set_event(event_t *arg)
+{
+    (void) arg;
+}
+
+void
+thread_reset_event(event_t *arg)
+{
+    (void) arg;
+}
+
+int
+thread_wait_event(event_t *arg, int timeout)
+{
+    (void) arg;
+    (void) timeout;
+    return 0;
+}
+
+void
+thread_destroy_event(event_t *arg)
+{
+    (void) arg;
+}
+
+/* ------------------------------------------------------------------ */
+static nv4_t     *nv4;
+static monitor_t  mon;
+
+static void
+card_new(void)
+{
+    nv4                    = calloc(1, sizeof(nv4_t));
+    nv4->vram_size         = VRAM_SIZE;
+    nv4->vram_mask         = VRAM_SIZE - 1;
+    nv4->svga.vram         = calloc(1, VRAM_SIZE);
+    nv4->svga.changedvram  = calloc(1, VRAM_SIZE >> 12);
+    nv4->svga.monitor      = &mon;
+    nv4->render_threads    = 1;
+    mon.mon_changeframecount = 2;
+    nv4_3d_init(nv4);
+}
+
+static void
+card_free(void)
+{
+    nv4_3d_close(nv4);
+    free(nv4->svga.vram);
+    free(nv4->svga.changedvram);
+    free(nv4);
+}
+
+/* The 3D surfaces as 0x53 leaves them: color A8R8G8B8 (format 0xc) at
+   COL_BASE, depth at Z_BASE, both with 64 KB limits; type 2 swizzled
+   2^wl by 2^hl, or type 1 with <pitch>. The user clip spans the
+   surface. */
+static void
+surfaces(int swz, int wl, int hl, uint32_t pitch, int zeta)
+{
+    NV4_GR(nv4, NV4_PGRAPH_SURFACE)          = swz ? 2 : 1;
+    NV4_GR(nv4, NV4_PGRAPH_BSWIZZLE2)        = ((uint32_t) hl << 24) | ((uint32_t) wl << 16);
+    NV4_GR(nv4, NV4_PGRAPH_BPIXEL)           = 0xc << 8;
+    NV4_GR(nv4, NV4_PGRAPH_BBASE + 2 * 4)    = COL_BASE;
+    NV4_GR(nv4, NV4_PGRAPH_BOFFSET + 2 * 4)  = 0;
+    NV4_GR(nv4, NV4_PGRAPH_BPITCH + 2 * 4)   = pitch;
+    NV4_GR(nv4, NV4_PGRAPH_BLIMIT + 2 * 4)   = 0xffff;
+    NV4_GR(nv4, NV4_PGRAPH_BBASE + 3 * 4)    = Z_BASE;
+    NV4_GR(nv4, NV4_PGRAPH_BOFFSET + 3 * 4)  = 0;
+    NV4_GR(nv4, NV4_PGRAPH_BPITCH + 3 * 4)   = swz ? 0 : pitch;
+    NV4_GR(nv4, NV4_PGRAPH_BLIMIT + 3 * 4)   = zeta ? 0xffff : 0x80000000;
+    NV4_GR(nv4, NV4_PGRAPH_UCLIP_MIN)        = 0;
+    NV4_GR(nv4, NV4_PGRAPH_UCLIP_MIN + 4)    = 0;
+    NV4_GR(nv4, NV4_PGRAPH_UCLIP_MAX)        = 0x1000;
+    NV4_GR(nv4, NV4_PGRAPH_UCLIP_MAX + 4)    = 0x1000;
+    /* as a 0x53 method would: the next triangle derives a new state */
+    nv4_3d_flush(nv4);
+}
+
+static uint32_t
+fbits(float f)
+{
+    uint32_t u;
+
+    memcpy(&u, &f, 4);
+    return u;
+}
+
+static void
+mthd(uint32_t m, uint32_t d)
+{
+    CHECK(nv4_pgraph_3d_method(nv4, 0, 0x54, m, d) == NV4_GR_OK);
+}
+
+/* DX5 state: untextured, no blending, no culling, depth test LESS with
+   writes when <zbuf>. */
+static void
+dx5_state(int zbuf)
+{
+    mthd(0x308, 0); /* no texture */
+    mthd(0x310, 0); /* blend: none */
+    mthd(0x314, zbuf ? ((0x3fu << 24) | (2u << 16) | (1u << 14)) : 0);
+}
+
+static void
+vertex(int i, float x, float y, float z, uint32_t color)
+{
+    uint32_t m = 0x400 + i * 0x20;
+
+    mthd(m + 0x00, fbits(x));
+    mthd(m + 0x04, fbits(y));
+    mthd(m + 0x08, fbits(z));
+    mthd(m + 0x0c, fbits(1.0f));
+    mthd(m + 0x10, color);
+    mthd(m + 0x14, 0);
+}
+
+/* A rectangle x0..x1, y0..y1 (pixel edges) as two triangles. */
+static void
+rect(float x0, float y0, float x1, float y1, float z, uint32_t color)
+{
+    vertex(0, x0, y0, z, color);
+    vertex(1, x1, y0, z, color);
+    vertex(2, x1, y1, z, color);
+    vertex(3, x0, y1, z, color);
+    mthd(0x600, 0x320210); /* triangles 0,1,2 and 0,2,3 */
+}
+
+/* Texel x,y of a 2^wl by 2^hl swizzled surface: bit i of x, then bit i
+   of y, while each lasts. */
+static uint32_t
+swz_ref(int x, int y, int wl, int hl)
+{
+    uint32_t r = 0;
+    int      n = 0;
+
+    for (int i = 0; i < 12; i++) {
+        if (i < wl)
+            r |= (uint32_t) ((x >> i) & 1) << n++;
+        if (i < hl)
+            r |= (uint32_t) ((y >> i) & 1) << n++;
+    }
+    return r;
+}
+
+static uint32_t
+rd32(uint32_t a)
+{
+    uint32_t v;
+
+    memcpy(&v, nv4->svga.vram + a, 4);
+    return v;
+}
+
+/* Every pixel of a swizzled target holds <in> inside x0..x1-1,
+   y0..y1-1 and 0 outside it; nothing past the surface is written. */
+static void
+check_swz(int wl, int hl, int x0, int y0, int x1, int y1, uint32_t in)
+{
+    int w = 1 << wl, h = 1 << hl;
+    int bad = 0;
+
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            uint32_t want = ((x >= x0) && (x < x1) && (y >= y0) && (y < y1)) ? in : 0;
+
+            if (rd32(COL_BASE + swz_ref(x, y, wl, hl) * 4) != want) {
+                if (bad++ < 4)
+                    fprintf(stderr, "  pixel %d,%d: %08x, want %08x\n", x, y,
+                            rd32(COL_BASE + swz_ref(x, y, wl, hl) * 4), want);
+            }
+        }
+    CHECK(bad == 0);
+    for (uint32_t a = COL_BASE + (uint32_t) w * h * 4; a < COL_BASE + 0x4000; a++)
+        if (nv4->svga.vram[a]) {
+            fprintf(stderr, "  byte past the surface at %06x\n", a);
+            failures++;
+            break;
+        }
+}
+
+/* A square 8x8 target: a 4x2 block lands at the swizzled offsets. */
+static void
+test_square(void)
+{
+    card_new();
+    surfaces(1, 3, 3, 0, 0);
+    /* NV15 keeps its flip counters above the surface layout bits. */
+    NV4_GR(nv4, NV4_PGRAPH_SURFACE) |= 0x21000000;
+    dx5_state(0);
+    rect(0, 0, 4, 2, 0.5f, 0xff112233);
+    nv4_3d_flush(nv4);
+    check_swz(3, 3, 0, 0, 4, 2, 0xff112233);
+    /* pixel 1,0 is texel 1, pixel 0,1 texel 2: not the pitch layout */
+    CHECK(rd32(COL_BASE + 1 * 4) == 0xff112233);
+    CHECK(rd32(COL_BASE + 2 * 4) == 0xff112233);
+    CHECK(rd32(COL_BASE + 4 * 4) == 0xff112233);  /* texel 4 = pixel 2,0 */
+    CHECK(rd32(COL_BASE + 16 * 4) == 0);          /* texel 16 = pixel 4,0: outside */
+    card_free();
+}
+
+/* A 16x4 target (u runs on alone past v's two bits), drawn past its
+   edges: the surface's size clips it. */
+static void
+test_wide_clipped(void)
+{
+    card_new();
+    surfaces(1, 4, 2, 0, 0);
+    dx5_state(0);
+    rect(2, 1, 40, 30, 0.5f, 0xff445566);
+    nv4_3d_flush(nv4);
+    check_swz(4, 2, 2, 1, 16, 4, 0xff445566);
+    card_free();
+}
+
+/* Depth on a swizzled target follows the same layout: a far rectangle
+   behind a near one loses where they meet. */
+static void
+test_depth(void)
+{
+    int bad = 0;
+
+    card_new();
+    surfaces(1, 3, 3, 0, 1);
+    /* clear depth to the far plane: Z in bits 31:8, stencil 0 */
+    for (int i = 0; i < 64; i++) {
+        uint32_t far = 0xffffff00;
+
+        memcpy(nv4->svga.vram + Z_BASE + i * 4, &far, 4);
+    }
+    dx5_state(1);
+    rect(0, 0, 8, 4, 0.25f, 0xff0000ff); /* near, top half */
+    rect(0, 0, 8, 8, 0.75f, 0xffff0000); /* far, everywhere */
+    nv4_3d_flush(nv4);
+    for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 8; x++) {
+            uint32_t o   = swz_ref(x, y, 3, 3) * 4;
+            uint32_t col = (y < 4) ? 0xff0000ff : 0xffff0000;
+            uint32_t z   = (uint32_t) (((y < 4) ? 0.25f : 0.75f) * 16777215.0f);
+
+            if ((rd32(COL_BASE + o) != col) || ((rd32(Z_BASE + o) >> 8) != z))
+                bad++;
+        }
+    CHECK(bad == 0);
+    card_free();
+}
+
+/* The pitch layout is untouched: rows at base + y * pitch. */
+static void
+test_pitch(void)
+{
+    int bad = 0;
+
+    card_new();
+    surfaces(0, 0, 0, 64, 0);
+    dx5_state(0);
+    rect(0, 0, 4, 2, 0.5f, 0xff778899);
+    nv4_3d_flush(nv4);
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 16; x++)
+            if (rd32(COL_BASE + y * 64 + x * 4) != (((x < 4) && (y < 2)) ? 0xff778899 : 0))
+                bad++;
+    CHECK(bad == 0);
+    card_free();
+}
+
+/* With rows shaded apart (as with threads or the GPU), a swizzled state
+   takes no row regions and makes its batch serial, and the batch is cut
+   where the target switches between the two layouts. */
+static void
+test_batch_split(void)
+{
+    nv4_3d_batch_t *b;
+
+    card_new();
+    b           = nv4->batch3d;
+    b->parallel = 1; /* one thread, no GPU: still shaded inline */
+
+    surfaces(0, 0, 0, 64, 0);
+    dx5_state(0);
+    rect(0, 0, 4, 2, 0.5f, 0xff010101);
+    CHECK(b->nregions == 1);
+    CHECK(!b->serial);
+    b->st_flushes = 0;
+
+    /* the switch to a swizzled target without a 0x53 method's flush:
+       only the state rule may cut the batch */
+    NV4_GR(nv4, NV4_PGRAPH_SURFACE)   = 2;
+    NV4_GR(nv4, NV4_PGRAPH_BSWIZZLE2) = (3u << 24) | (3u << 16);
+    NV4_GR(nv4, NV4_PGRAPH_BBASE + 2 * 4) = COL_BASE + 0x8000;
+    dx5_state(0);
+    rect(0, 0, 8, 8, 0.5f, 0xff020202);
+    CHECK(b->st_flushes == 1);
+    CHECK(b->serial);
+    CHECK(b->nregions == 0);
+    CHECK(b->nstates == 1);
+
+    NV4_GR(nv4, NV4_PGRAPH_SURFACE)       = 1;
+    NV4_GR(nv4, NV4_PGRAPH_BBASE + 2 * 4) = COL_BASE;
+    dx5_state(0);
+    rect(0, 2, 4, 4, 0.5f, 0xff030303);
+    CHECK(b->st_flushes == 2);
+    CHECK(!b->serial);
+    nv4_3d_flush(nv4);
+
+    CHECK(rd32(COL_BASE + 0 * 64) == 0xff010101);
+    CHECK(rd32(COL_BASE + 3 * 64) == 0xff030303);
+    CHECK(rd32(COL_BASE + 0x8000 + 63 * 4) == 0xff020202);
+    card_free();
+}
+
+/* Surface bounds are inclusive: adjacent color/depth buffers can use
+   separate rows, but even a one-byte overlap must remain serial. */
+static void
+test_adjacent_depth(void)
+{
+    nv4_3d_batch_t *b;
+
+    card_new();
+    b = nv4->batch3d;
+    b->parallel = 1;
+    for (int reverse = 0; reverse < 2; reverse++)
+        for (int overlap = 0; overlap < 2; overlap++) {
+            nv4_3d_state_t s = { 0 };
+            s.bpp = 4;
+            s.cx1 = 16;
+            s.cy1 = 8;
+            s.col_pitch = s.z_pitch = 64;
+            s.col_base = COL_BASE + (reverse ? 512 - overlap : 0);
+            s.z_base = COL_BASE + (reverse ? 0 : 512 - overlap);
+            s.z_on = 1;
+            nv4_3d_place_state(nv4, b, &s);
+            CHECK(b->serial == overlap);
+            CHECK(b->nregions == (overlap ? 1 : 2));
+            nv4_3d_flush(nv4);
+        }
+    card_free();
+}
+
+static void
+test_notify_batch(void)
+{
+    card_new();
+    surfaces(0, 0, 0, 64, 0);
+    dx5_state(0);
+    rect(0, 0, 4, 2, 0.5f, 0xff778899);
+    int spans = nv4->batch3d->nspans;
+    CHECK(spans > 0);
+    nv4_3d_notify(nv4);
+    CHECK(nv4->batch3d->nspans == spans);
+    CHECK(rd32(COL_BASE) == 0);
+    /* System-memory input must be captured before notifying completion. */
+    nv4->batch3d->bus_tex = 1;
+    nv4_3d_notify(nv4);
+    CHECK(nv4->batch3d->nspans == 0);
+    CHECK(rd32(COL_BASE) == 0xff778899);
+    card_free();
+}
+
+/* The driver can leave an aliasing placeholder depth surface enabled. */
+static void
+test_unused_depth(void)
+{
+    card_new();
+    nv4->batch3d->parallel = 1;
+    for (int func = 0; func < 16; func++) {
+        surfaces(0, 0, 0, 64, 1);
+        NV4_GR(nv4, NV4_PGRAPH_BPITCH + 3 * 4) = 16;
+        dx5_state(0);
+        mthd(0x314, (1u << 14) | ((uint32_t) func << 16));
+        rect(0, 0, 4, 2, 0.5f, 0xff778899);
+        int unused = func == 0 || func >= 8;
+        CHECK(nv4->batch3d->states[0].z_on == !unused);
+        CHECK(nv4->batch3d->serial == !unused);
+    }
+    card_free();
+}
+
+static void
+test_deferred_copy(void)
+{
+    card_new();
+    nv4_3d_batch_t *b = nv4->batch3d;
+    for (int trigger = 0; trigger < 5; trigger++) {
+        memset(nv4->svga.vram + COL_BASE, 0x35 + trigger, 128);
+        memset(nv4->svga.vram + Z_BASE, 0, 128);
+        b->fly.busy    = 1;
+        b->fly.nranges = 1;
+        b->fly.lo[0]   = COL_BASE;
+        b->fly.hi[0]   = COL_BASE + 127;
+        CHECK(nv4_3d_copy(nv4, COL_BASE, Z_BASE, 64, 64, 16, 2));
+        CHECK(b->copy.pending);
+        CHECK(nv4->svga.vram[Z_BASE] == 0);
+        nv4_3d_touch(nv4, 0, 15, 0);
+        CHECK(b->copy.pending);
+        if (trigger == 0)
+            nv4_3d_touch(nv4, COL_BASE, COL_BASE, 0);
+        else if (trigger == 1)
+            nv4_3d_touch(nv4, Z_BASE, Z_BASE, 0);
+        else if (trigger == 2)
+            nv4_3d_vblank(nv4, Z_BASE, Z_BASE + 127);
+        else if (trigger == 3)
+            nv4_3d_sync(nv4, 0);
+        else
+            nv4_3d_reset(nv4);
+        CHECK(!b->copy.pending);
+        CHECK(!b->fly.busy);
+        for (int y = 0; y < 2; y++)
+            for (int x = 0; x < 64; x++)
+                CHECK(nv4->svga.vram[Z_BASE + y * 64 + x] == (x < 16 ? 0x35 + trigger : 0));
+        CHECK(nv4->svga.changedvram[Z_BASE >> 12] == mon.mon_changeframecount);
+    }
+    card_free();
+}
+
+/* Compare the generated spans with the original per-pixel integer
+   top-left test, including subpixels, both windings and clipping. */
+static void
+test_triangle_edges(void)
+{
+    uint32_t rng = 0x986723;
+    card_new();
+    surfaces(0, 0, 0, 128, 0);
+    for (int n = 0; n < 3000; n++) {
+        int32_t       X[3], Y[3];
+        unsigned char got[32][32] = { 0 };
+        nv4_3d_flush(nv4);
+        dx5_state(0);
+        mthd(0x314, (n & 1) ? (1u << 13) : 0);
+        for (int i = 0; i < 3; i++) {
+            rng  = rng * 1664525u + 1013904223u;
+            X[i] = (int32_t) (rng % 768) - 128;
+            rng  = rng * 1664525u + 1013904223u;
+            Y[i] = (int32_t) (rng % 768) - 128;
+            vertex(i, X[i] / 16.0f, Y[i] / 16.0f, 0.5f, 0xff112233);
+        }
+        nv4_3d_triangle(nv4, 0, 0x54, 0, 1, 2);
+        nv4_3d_batch_t *b = nv4->batch3d;
+        for (int i = 0; i < b->nspans; i++) {
+            nv4_3d_span_t *sp = &b->spans[i];
+            for (int x = sp->x0; x < sp->x1 && x < 32; x++)
+                if (sp->y >= 0 && sp->y < 32 && x >= 0)
+                    got[sp->y][x] = 1;
+        }
+        int64_t area = (int64_t) (X[1] - X[0]) * (Y[2] - Y[0]) - (int64_t) (X[2] - X[0]) * (Y[1] - Y[0]);
+        for (int y = 0; y < 32; y++)
+            for (int x = 0; x < 32; x++) {
+                int inside = area != 0;
+                for (int e = 0; e < 3; e++) {
+                    int     c  = (e + 1) % 3;
+                    int64_t ex = X[c] - X[e], ey = Y[c] - Y[e];
+                    if (area > 0) {
+                        ex = -ex;
+                        ey = -ey;
+                    }
+                    int     off = (n & 1) ? 8 : 0;
+                    int64_t v   = ey * (x * 16 + off - X[e]) - ex * (y * 16 + off - Y[e]);
+                    int     tl  = ey > 0 || (ey == 0 && ex < 0);
+                    inside &= tl ? v >= 0 : v > 0;
+                }
+                if (got[y][x] != inside) {
+                    fprintf(stderr, "triangle %d pixel %d,%d: got %d expected %d\n", n, x, y, got[y][x], inside);
+                    exit(1);
+                }
+            }
+    }
+    card_free();
+}
+
+/* Draw one Celsius fragment through each GL logic op. Red and blue are
+   writable. The destination's green, alpha and neighbouring bytes survive. */
+static void
+test_nv15_logic_ops(void)
+{
+    const uint32_t color = 0xb3e75291, dst = 0x9c3176a5;
+    nv4_3d_state_t state = { .celsius = 1, .wr_r = 1, .wr_b = 1,
+                             .col_base = COL_BASE, .col_lim = COL_BASE + 3,
+                             .rc_k = { color }, .rc_f0 = 1, .rc_f1 = 0x1100 };
+    nv4_3d_tri_t tri = { 0 };
+    nv4_3d_tri_ext_t ext = { 0 };
+    nv4_3d_span_t span = { .x1 = 1 };
+
+    card_new();
+    tri.c[AT_Q] = 1.0f;
+    for (int bpp = 2; bpp <= 4; bpp += 2) {
+        uint32_t src = bpp == 2 ? 0xe292 : color; /* RGB565 or A8R8G8B8 */
+        uint32_t mask = bpp == 2 ? 0xf81f : 0xff00ff;
+        const uint32_t ops[] = {
+            0, src & dst, src & ~dst, src, ~src & dst, dst, src ^ dst, src | dst,
+            ~(src | dst), ~(src ^ dst), ~dst, src | ~dst, ~src, ~src | dst, ~(src & dst), ~0u
+        };
+        state.bpp = bpp;
+        state.col_fmt = bpp == 2 ? 5 : 0xc;
+        for (int op = 0; op < 16; op++) {
+            memcpy(nv4->svga.vram + COL_BASE, &dst, 4);
+            state.logic_op = 0x10 | op;
+            nv4_3d_span(nv4, &state, &tri, &ext, &span);
+            CHECK(rd32(COL_BASE) == ((ops[op] & mask) | (dst & ~mask)));
+        }
+    }
+    card_free();
+}
+
+int
+main(void)
+{
+    test_square();
+    test_nv15_logic_ops();
+    test_wide_clipped();
+    test_depth();
+    test_pitch();
+    test_batch_split();
+    test_adjacent_depth();
+    test_notify_batch();
+    test_unused_depth();
+    test_deferred_copy();
+    test_triangle_edges();
+    if (failures)
+        fprintf(stderr, "%d failure(s)\n", failures);
+    else
+        printf("nv4 3D swizzle tests passed\n");
+    return failures != 0;
+}
