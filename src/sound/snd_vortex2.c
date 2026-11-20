@@ -249,6 +249,31 @@ trace_time(const vortex2_t *dev)
 #define V2_CTRL_FM_EN 0x4
 
 static uint8_t fm_read(uint16_t port, void *priv);
+static double  trace_time(const vortex2_t *dev);
+
+/* The MPU-401 ports go through the device so that the trace option can
+   record them (as "port" lines, which v2replay skips): MIDI problems are
+   otherwise invisible in a trace. */
+static uint8_t
+mpu_port_read(uint16_t port, void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+    uint8_t    v   = mpu401_read(port, dev->mpu);
+
+    if (dev->tracef)
+        fprintf(dev->tracef, "%11.6f  R 0x%05x port 0x%08x\n", trace_time(dev), port, v);
+    return v;
+}
+
+static void
+mpu_port_write(uint16_t port, uint8_t val, void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    if (dev->tracef)
+        fprintf(dev->tracef, "%11.6f  W 0x%05x port 0x%08x\n", trace_time(dev), port, val);
+    mpu401_write(port, val, dev->mpu);
+}
 static void    fm_write(uint16_t port, uint8_t val, void *priv);
 
 static void
@@ -259,7 +284,11 @@ legacy_remap(vortex2_t *dev)
     uint16_t game = (ctl & 8) ? (0x200 + ((ctl >> 9) & 7)) : 0;
 
     if (dev->mpu && midi != dev->mpu_addr) {
-        mpu401_change_addr(dev->mpu, midi);
+        if (dev->mpu_addr)
+            io_removehandler(dev->mpu_addr, 2, mpu_port_read, NULL, NULL, mpu_port_write, NULL, NULL, dev);
+        if (midi)
+            io_sethandler(midi, 2, mpu_port_read, NULL, NULL, mpu_port_write, NULL, NULL, dev);
+        dev->mpu->addr = midi;
         dev->mpu_addr = midi;
         vortex2_log("Vortex2: MPU-401 at %03x\n", midi);
     }
@@ -776,13 +805,23 @@ vortex2_block(void *priv)
     float rl = dev->rear_mix ? (float) sl / 32768.0f : 0.0f;
     float rr = dev->rear_mix ? (float) sr / 32768.0f : 0.0f;
 
+    /* Mixing the rear pair in: each output saturates on its own (the chip's
+       output clips at digital full scale before the codec's volume; run
+       12), and the two pairs are then averaged by the rear volume. In four-
+       speaker mode the driver sends the same sound to front and rear, so a
+       plain sum would be twice full scale on loud sounds and clip (dxdiag's
+       test sounds peak at 0.6 on each pair). */
+    float nl = 1.0f / (1.0f + rl), nr = 1.0f / (1.0f + rr);
+
     for (int n = 0; n < V2_BLOCK; n++) {
-        float l = dev->out[n * 4 + 0] + dev->out[n * 4 + 2] * rl;
-        float r = dev->out[n * 4 + 1] + dev->out[n * 4 + 3] * rr;
-        /* The chip's output saturates at digital full scale before the
-           codec's volume (run 12: summed tones clip at full scale). */
-        l = (l > 1.0f) ? 1.0f : ((l < -1.0f) ? -1.0f : l);
-        r = (r > 1.0f) ? 1.0f : ((r < -1.0f) ? -1.0f : r);
+        float l = dev->out[n * 4 + 0], r = dev->out[n * 4 + 1];
+        float bl = dev->out[n * 4 + 2], br = dev->out[n * 4 + 3];
+        l  = (l > 1.0f) ? 1.0f : ((l < -1.0f) ? -1.0f : l);
+        r  = (r > 1.0f) ? 1.0f : ((r < -1.0f) ? -1.0f : r);
+        bl = (bl > 1.0f) ? 1.0f : ((bl < -1.0f) ? -1.0f : bl);
+        br = (br > 1.0f) ? 1.0f : ((br < -1.0f) ? -1.0f : br);
+        l  = (l + bl * rl) * nl;
+        r  = (r + br * rr) * nr;
         int   w = (dev->ring_rd + dev->ring_n) % (V2_BLOCK * 8);
         if (dev->ring_n >= V2_BLOCK * 8) { /* consumer stalled: drop the oldest */
             dev->ring_rd = (dev->ring_rd + 1) % (V2_BLOCK * 8);
