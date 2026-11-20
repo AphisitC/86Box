@@ -424,6 +424,9 @@ extern const device_t ati28800k_spc4620p_device;
 extern const device_t ati28800k_spc6033p_device;
 extern const device_t ati28800_wonderxl24_device;
 
+#ifdef USE_R100
+extern const device_t ati_r100_device;
+#endif
 /* Bochs */
 extern const device_t bochs_svga_device;
 
@@ -677,6 +680,8 @@ extern const device_t voodoo_3_3000_agp_device;
 extern const device_t voodoo_3_3500_agp_device;
 extern const device_t velocity_100_agp_device;
 extern const device_t velocity_200_agp_device;
+extern const device_t riva128_pci_device;
+extern const device_t rivatnt_pci_device;
 
 /* PowerVR PCX1/PCX2 */
 extern const device_t powervr_pcx_device;
@@ -705,6 +710,25 @@ enum {
     HD44780_COLOR_NONE,
     HD44780_COLOR_MAX
 };
+
+/* Nvidia */
+extern const device_t nv3_device_pci;
+extern const device_t nv3_device_agp;
+extern const device_t nv3t_device_pci;
+extern const device_t nv3t_device_agp;
+extern const device_t nv4_tnt_pci_device;
+extern const device_t nv4_tnt_agp_device;
+extern const device_t nv5_tnt2_pci_device;
+extern const device_t nv5_tnt2_agp_device;
+extern const device_t nv5_tnt2_ultra_pci_device;
+extern const device_t nv5_tnt2_ultra_agp_device;
+extern const device_t nv5_vanta_pci_device;
+extern const device_t nv5_vanta_agp_device;
+extern const device_t nv10_geforce256_agp_device;
+extern const device_t nv10_geforce256_ddr_agp_device;
+extern const device_t nv10_quadro_agp_device;
+extern const device_t nv15_geforce2_gts_agp_device;
+extern const device_t nv15_geforce2_pro_agp_device;
 
 #endif
 
